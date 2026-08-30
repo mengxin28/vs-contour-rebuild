@@ -31,7 +31,8 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 
 默认参数：降采样 `0.5m`、密度栅格 `0.3m`（见 `code/preprocess.py` 顶部常量
 `VOXEL`、`MIN_NEIGHBORS`、`NORM_RADIUS`、`HORIZ_TOL`、`DENSITY_GRID`）。
-贴合轮廓线用 `RASTER_GRID`、`CLOSE_ITER`、`OPEN_KERNEL`、`SIMPLIFY_TOL`（见 `code/contour.py` 顶部）。
+贴合轮廓线用 `RASTER_GRID`、`CLOSE_ITER`、`OPEN_KERNEL`、`SIMPLIFY_TOL`；
+规则化（转正+Douglas-Peucker）用 `REG_TOL`（见 `code/contour.py` 顶部）。
 
 ## 输出（写入 `输出/`）
 阶段一（`preprocess.py`），每个源文件 `NAME` 生成：

@@ -17,6 +17,7 @@
 import os
 import sys
 import json
+import math
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -37,7 +38,8 @@ except Exception:
 RASTER_GRID = 0.5   # 栅格边长(m)，越小越精细
 CLOSE_ITER = 2      # 闭运算次数：把外墙缝连起来（0=不连缝）
 OPEN_KERNEL = 2     # 开运算核边长：去掉一格外伸的细刺(0=不去刺)
-SIMPLIFY_TOL = 0.8  # 轮廓线简化容差(m)
+SIMPLIFY_TOL = 0.8  # 贴合轮廓线简化容差(m)
+REG_TOL = 4.0       # 规则化：Douglas-Peucker 简化容差(m)，越大越规则(顶点越少)
 
 
 def read_wall_xy(ply_path):
@@ -85,11 +87,46 @@ def trace_outline(pts, grid=RASTER_GRID, close_iter=CLOSE_ITER,
     return poly
 
 
-def plot_result(pts, poly, path, title):
+def _rotate(pts, angle):
+    c, s = math.cos(angle), math.sin(angle)
+    R = np.array([[c, -s], [s, c]])
+    return pts @ R.T
+
+
+def regularize(poly, tol=REG_TOL):
+    """把贴合轮廓线规则化：转到主方向后做 Douglas-Peucker，使每段墙成为一条直边。
+    DP 在欧氏距离下与方向无关，故转正主要作为后续"吸附主导方向"的锚点；此处转正后简化再转回，
+    保证输出外形不受因旋转引入的坐标误差影响。"""
+    if poly.geom_type != "Polygon" or poly.exterior is None:
+        return poly
+    rc = np.asarray(poly.minimum_rotated_rectangle.exterior.coords)
+    d = rc[1] - rc[0]
+    ang = math.atan2(d[1], d[0]) % (math.pi / 2)
+    if ang > math.pi / 4:
+        ang -= math.pi / 2
+    coords = np.asarray(poly.exterior.coords)[:-1]
+    rot = _rotate(coords, -ang)          # 转正：主方向墙对齐坐标轴
+    simp = poly.simplify(tol, preserve_topology=True)
+    if simp.geom_type != "Polygon" or simp.exterior is None:
+        return poly
+    s = np.asarray(simp.exterior.coords)[:-1]
+    back = _rotate(s, ang)               # 转回原方向
+    newpoly = Polygon(np.vstack([back, back[:1]]))
+    if not newpoly.is_valid:
+        newpoly = newpoly.buffer(0)
+    if newpoly.geom_type != "Polygon":
+        return poly
+    return newpoly
+
+
+def plot_result(pts, poly, hug_poly, path, title):
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#1f77b4", marker=".", alpha=0.55)
+    ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#1f77b4", marker=".", alpha=0.5)
+    if hug_poly is not None:
+        hx, hy = np.asarray(hug_poly.exterior.coords).T
+        ax.plot(hx, hy, "-", color="#7f7f7f", lw=1, alpha=0.7, label="贴合外沿(原始)")
     px, py = np.asarray(poly.exterior.coords).T
-    ax.plot(px, py, "-", color="#d62728", lw=2, label="贴合外沿的轮廓线")
+    ax.plot(px, py, "-", color="#d62728", lw=2.2, label="规则化外轮廓")
     ax.legend(loc="best")
     x0, x1 = pts[:, 0].min(), pts[:, 0].max()
     y0, y1 = pts[:, 1].min(), pts[:, 1].max()
@@ -107,9 +144,10 @@ def plot_result(pts, poly, path, title):
 
 
 def process(base, wall_ply, out_dir):
-    print("\n========== 贴合轮廓线: %s ==========" % wall_ply)
+    print("\n========== 规则外轮廓: %s ==========" % wall_ply)
     pts = read_wall_xy(wall_ply)
-    poly = trace_outline(pts)
+    hug = trace_outline(pts)            # 贴合外沿的线
+    poly = regularize(hug)              # 规则化（直角规整）
     coords = np.asarray(poly.exterior.coords)
     info = {
         "wall_points": int(len(pts)),
@@ -117,13 +155,13 @@ def process(base, wall_ply, out_dir):
         "outline_area_m2": round(float(poly.area), 2),
         "outline_perimeter_m": round(float(poly.length), 2),
         "raster_grid_m": RASTER_GRID,
-        "simplify_tol_m": SIMPLIFY_TOL,
+        "reg_tol_m": REG_TOL,
         "outline_vertices_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in coords[:-1]],
     }
-    plot_result(pts, poly, "%s/%s_外轮廓.png" % (out_dir, base), "%s 贴合外墙轮廓线" % base)
+    plot_result(pts, poly, hug, "%s/%s_外轮廓.png" % (out_dir, base), "%s 规则化外轮廓" % base)
     with open("%s/%s_外轮廓.json" % (out_dir, base), "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
-    print("轮廓线顶点=%d, 面积=%.1f m², 周长=%.1f m" %
+    print("规则化后顶点=%d, 面积=%.1f m², 周长=%.1f m" %
           (info["outline_vertices"], info["outline_area_m2"], info["outline_perimeter_m"]))
     return info
 
