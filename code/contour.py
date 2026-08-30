@@ -94,53 +94,67 @@ def _rotate(pts, angle):
 
 
 def regularize(poly, tol=REG_TOL):
-    """把贴合轮廓线规则化：转到主方向后做 Douglas-Peucker，使每段墙成为一条直边。
-    DP 在欧氏距离下与方向无关，故转正主要作为后续"吸附主导方向"的锚点；此处转正后简化再转回，
-    保证输出外形不受因旋转引入的坐标误差影响。"""
+    """把贴合轮廓线规则化成"多条直边"的规整多边形：Douglas-Peucker 去阶梯成直边。
+    DP 在欧氏距离下与方向无关（车库可能是正交或统一斜角），故不必旋转；直接简化即可。
+    （之前的"转正再转回"会因绕原点大角度旋转使远处坐标平移，导致轮廓跑偏，已移除。）"""
     if poly.geom_type != "Polygon" or poly.exterior is None:
         return poly
-    rc = np.asarray(poly.minimum_rotated_rectangle.exterior.coords)
-    d = rc[1] - rc[0]
-    ang = math.atan2(d[1], d[0]) % (math.pi / 2)
-    if ang > math.pi / 4:
-        ang -= math.pi / 2
-    coords = np.asarray(poly.exterior.coords)[:-1]
-    rot = _rotate(coords, -ang)          # 转正：主方向墙对齐坐标轴
     simp = poly.simplify(tol, preserve_topology=True)
     if simp.geom_type != "Polygon" or simp.exterior is None:
         return poly
-    s = np.asarray(simp.exterior.coords)[:-1]
-    back = _rotate(s, ang)               # 转回原方向
-    newpoly = Polygon(np.vstack([back, back[:1]]))
-    if not newpoly.is_valid:
-        newpoly = newpoly.buffer(0)
-    if newpoly.geom_type != "Polygon":
+    if not simp.is_valid:
+        simp = simp.buffer(0)
+    if simp.geom_type != "Polygon":
         return poly
-    return newpoly
+    return simp
 
 
-def plot_result(pts, poly, hug_poly, path, title):
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#1f77b4", marker=".", alpha=0.5)
-    if hug_poly is not None:
-        hx, hy = np.asarray(hug_poly.exterior.coords).T
-        ax.plot(hx, hy, "-", color="#7f7f7f", lw=1, alpha=0.7, label="贴合外沿(原始)")
-    px, py = np.asarray(poly.exterior.coords).T
-    ax.plot(px, py, "-", color="#d62728", lw=2.2, label="规则化外轮廓")
-    ax.legend(loc="best")
+def _view_lims(pts):
     x0, x1 = pts[:, 0].min(), pts[:, 0].max()
     y0, y1 = pts[:, 1].min(), pts[:, 1].max()
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     half = max(x1 - x0, y1 - y0) / 2 * 1.05
-    ax.set_xlim(cx - half, cx + half)
-    ax.set_ylim(cy - half, cy + half)
+    return cx - half, cx + half, cy - half, cy + half
+
+
+def _save_plot(ax, path, title):
     ax.set_aspect("equal")
     ax.set_title(title)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
+    fig = ax.figure
     fig.tight_layout()
-    fig.savefig(path, dpi=135)
+    fig.savefig(path, dpi=140)
     plt.close(fig)
+
+
+def plot_line_only(poly, path, title):
+    """纯轮廓线图（白底、粗红实线+顶点圆点），便于直接查看轮廓。"""
+    fig, ax = plt.subplots(figsize=(9, 6))
+    px, py = np.asarray(poly.exterior.coords).T
+    ax.plot(px, py, "-", color="#d62728", lw=3.0, label="规则化外轮廓")
+    ax.plot(px, py, "o", color="#d62728", ms=4, alpha=0.9)
+    xl = _view_lims(np.asarray(poly.exterior.coords))
+    ax.set_xlim(xl[0], xl[1])
+    ax.set_ylim(xl[2], xl[3])
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    _save_plot(ax, path, title)
+
+
+def plot_result(pts, poly, hug_poly, path, title):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.scatter(pts[:, 0], pts[:, 1], s=0.25, c="#9ecae1", marker=".", alpha=0.45)
+    if hug_poly is not None:
+        hx, hy = np.asarray(hug_poly.exterior.coords).T
+        ax.plot(hx, hy, "-", color="#7f7f7f", lw=1, alpha=0.6, label="贴合外沿(原始)")
+    px, py = np.asarray(poly.exterior.coords).T
+    ax.plot(px, py, "-", color="#d62728", lw=2.8, label="规则化外轮廓")
+    ax.plot(px, py, "o", color="#d62728", ms=3.5, alpha=0.9)
+    ax.legend(loc="best")
+    ax.set_xlim(*_view_lims(pts)[:2])
+    ax.set_ylim(*_view_lims(pts)[2:])
+    _save_plot(ax, path, title)
 
 
 def process(base, wall_ply, out_dir):
@@ -159,6 +173,7 @@ def process(base, wall_ply, out_dir):
         "outline_vertices_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in coords[:-1]],
     }
     plot_result(pts, poly, hug, "%s/%s_外轮廓.png" % (out_dir, base), "%s 规则化外轮廓" % base)
+    plot_line_only(poly, "%s/%s_轮廓线.png" % (out_dir, base), "%s 规则化外轮廓线" % base)
     with open("%s/%s_外轮廓.json" % (out_dir, base), "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
     print("规则化后顶点=%d, 面积=%.1f m², 周长=%.1f m" %

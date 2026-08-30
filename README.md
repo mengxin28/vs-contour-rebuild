@@ -44,7 +44,8 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 - `汇总.json` —— 各阶段点数、bbox、密度峰值
 
 阶段二（`contour.py`），每个 `NAME_wall.ply` 生成：
-- `NAME_外轮廓.png` —— 墙点散点 + **贴合外墙走向的轮廓线**(红)
+- `NAME_轮廓线.png` —— **纯轮廓线图**（白底红粗线+顶点，最直观）
+- `NAME_外轮廓.png` —— 墙点散点 + 规则化外轮廓(红粗线) + 贴合外沿原始线(灰)
 - `NAME_外轮廓.json` —— 轮廓线顶点坐标、面积、周长（含栅格/容差参数）
 - `外轮廓_汇总.json`
 
