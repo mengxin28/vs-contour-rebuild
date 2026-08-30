@@ -25,13 +25,13 @@ python code/preprocess.py <点云文件...>
 python code/preprocess.py 粟塘B1.las 雅德B1.las
 python code/preprocess.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 
-# 阶段二：规则外轮廓提取（读阶段一的 *_wall.ply）
+# 阶段二：贴合外墙轮廓线提取（读阶段一的 *_wall.ply）
 python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.ply
 ```
 
 默认参数：降采样 `0.5m`、密度栅格 `0.3m`（见 `code/preprocess.py` 顶部常量
 `VOXEL`、`MIN_NEIGHBORS`、`NORM_RADIUS`、`HORIZ_TOL`、`DENSITY_GRID`）。
-外轮廓用 `CONCAVE_RATIO`/`SIMPLIFY_TOL`（见 `code/contour.py` 顶部）。
+贴合轮廓线用 `RASTER_GRID`、`CLOSE_ITER`、`OPEN_KERNEL`、`SIMPLIFY_TOL`（见 `code/contour.py` 顶部）。
 
 ## 输出（写入 `输出/`）
 阶段一（`preprocess.py`），每个源文件 `NAME` 生成：
@@ -43,8 +43,8 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 - `汇总.json` —— 各阶段点数、bbox、密度峰值
 
 阶段二（`contour.py`），每个 `NAME_wall.ply` 生成：
-- `NAME_外轮廓.png` —— 墙点 + 规则外轮廓多边形(红) + 最小外接矩形(绿虚线)
-- `NAME_外轮廓.json` —— 外轮廓顶点坐标、面积、周长、外接矩形
+- `NAME_外轮廓.png` —— 墙点散点 + **贴合外墙走向的轮廓线**(红)
+- `NAME_外轮廓.json` —— 轮廓线顶点坐标、面积、周长（含栅格/容差参数）
 - `外轮廓_汇总.json`
 
 ## 版本历史

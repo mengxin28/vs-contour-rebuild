@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-地下车库 规则外轮廓提取（阶段二）
+地下车库 贴合外墙轮廓线提取（阶段二）
 输入：阶段一输出的 `*_wall.ply`（投影后 Z=0 的外墙点云）。
+目标：输出一条**贴合外沿墙体走向的轮廓线**（沿真实墙体外沿走线，保留真实转角与内凹，
+      不在凹口/空腔处搭斜线、不用凹包/凸包包合成闭合区域）。
+方法：墙点栅格化 -> 形态学闭运算(连缝) -> 填充内部空腔 -> 提取外沿轮廓(marching squares)
+      -> shapely 简化成直线段 -> 输出折线与统计。
 输出：
-  - `*_外轮廓.png` —— 墙点散点上叠加 外轮廓多边形 + 最小外接旋转矩形
-  - `*_外轮廓.json` —— 外轮廓多边形顶点、面积、周长、最小外接矩形信息
-方法：凹包(concave hull) -> 取最大多边形 -> Douglas-Peucker 简化成直线段多边形。
-
+  - `*_外轮廓.png` —— 墙点散点上叠加「贴合外沿的轮廓线」
+  - `*_外轮廓.json` —— 轮廓线顶点、面积、周长
 用法：
     python contour.py <wall.ply ...>
 例如：
@@ -19,8 +21,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from shapely.geometry import MultiPoint, Polygon
-from shapely import concave_hull
+from scipy.ndimage import binary_closing, binary_fill_holes, binary_opening
+from shapely.geometry import Polygon
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -32,8 +34,10 @@ try:
 except Exception:
     pass
 
-CONCAVE_RATIO = 0.15   # 凹包参数: 越小越贴凹边, 1=凸包
-SIMPLIFY_TOL = 0.8     # 欧几里得简化容差(m)
+RASTER_GRID = 0.5   # 栅格边长(m)，越小越精细
+CLOSE_ITER = 2      # 闭运算次数：把外墙缝连起来（0=不连缝）
+OPEN_KERNEL = 2     # 开运算核边长：去掉一格外伸的细刺(0=不去刺)
+SIMPLIFY_TOL = 0.8  # 轮廓线简化容差(m)
 
 
 def read_wall_xy(ply_path):
@@ -45,32 +49,47 @@ def read_wall_xy(ply_path):
     return pts[:, :2]
 
 
-def largest_polygon(geom):
-    """若结果是多边形集合，取面积最大的一个外环。"""
-    if geom.geom_type == "Polygon":
-        return geom
-    if geom.geom_type == "MultiPolygon":
-        return max(geom.geoms, key=lambda g: g.area)
-    raise ValueError("凹包结果不是多边形: %s" % geom.geom_type)
+def raster_mask(pts, grid=RASTER_GRID):
+    """墙点 -> 占用栅格布尔掩码 + 原点与尺寸。"""
+    x0, y0 = pts.min(axis=0)
+    g = np.floor((pts - [x0, y0]) / grid).astype(np.int64)
+    nx, ny = int(g[:, 0].max()) + 1, int(g[:, 1].max()) + 1
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[g[:, 1], g[:, 0]] = True
+    return mask, (float(x0), float(y0)), grid
 
 
-def extract_contour(pts, ratio=CONCAVE_RATIO, tol=SIMPLIFY_TOL):
-    """返回 (简化外轮廓 Polygon, 最小外接旋转矩形 Polygon)。"""
-    mp = MultiPoint(pts)
-    hull = concave_hull(mp, ratio=ratio, allow_holes=False)
-    poly = largest_polygon(hull)
+def trace_outline(pts, grid=RASTER_GRID, close_iter=CLOSE_ITER,
+                  open_kernel=OPEN_KERNEL, tol=SIMPLIFY_TOL):
+    """栅格化 -> 连缝 -> 填内部空腔 -> 去外伸细刺 -> 提取外沿轮廓 -> 简化。返回闭合 Polygon。"""
+    mask, (x0, y0), g = raster_mask(pts, grid)
+    if close_iter:
+        mask = binary_closing(mask, structure=np.ones((3, 3), dtype=bool), iterations=close_iter)
+    mask = binary_fill_holes(mask)
+    if open_kernel:
+        mask = binary_opening(mask,
+                              structure=np.ones((open_kernel, open_kernel), dtype=bool))
+    # 用 matplotlib 的 marching squares 在该级(0.5)提轮廓；外沿为最长的一条
+    cs = plt.contour(mask.astype(np.float64), levels=[0.5])
+    segs = cs.allsegs[0]
+    if not segs:
+        plt.close(cs.axes.figure)
+        raise ValueError("未提取到轮廓线")
+    path = max(segs, key=lambda a: len(a))       # 索引坐标 (col, row)
+    plt.close(cs.axes.figure)
+    xy = np.column_stack([x0 + path[:, 0] * g, y0 + path[:, 1] * g])
+    poly = Polygon(xy)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
     poly = poly.simplify(tol, preserve_topology=True)
-    rect = poly.minimum_rotated_rectangle
-    return poly, rect
+    return poly
 
 
-def plot_result(pts, poly, rect, path, title):
+def plot_result(pts, poly, path, title):
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#1f77b4", marker=".", alpha=0.6)
+    ax.scatter(pts[:, 0], pts[:, 1], s=0.3, c="#1f77b4", marker=".", alpha=0.55)
     px, py = np.asarray(poly.exterior.coords).T
-    ax.plot(px, py, "-", color="#d62728", lw=2, label="外轮廓(简化)")
-    rx, ry = np.asarray(rect.exterior.coords).T
-    ax.plot(rx, ry, "--", color="#2ca02c", lw=1.5, label="最小外接矩形")
+    ax.plot(px, py, "-", color="#d62728", lw=2, label="贴合外沿的轮廓线")
     ax.legend(loc="best")
     x0, x1 = pts[:, 0].min(), pts[:, 0].max()
     y0, y1 = pts[:, 1].min(), pts[:, 1].max()
@@ -88,25 +107,23 @@ def plot_result(pts, poly, rect, path, title):
 
 
 def process(base, wall_ply, out_dir):
-    print("\n========== 外轮廓: %s ==========" % wall_ply)
+    print("\n========== 贴合轮廓线: %s ==========" % wall_ply)
     pts = read_wall_xy(wall_ply)
-    poly, rect = extract_contour(pts)
+    poly = trace_outline(pts)
     coords = np.asarray(poly.exterior.coords)
-    rcoords = np.asarray(rect.exterior.coords)
     info = {
         "wall_points": int(len(pts)),
         "outline_vertices": int(len(coords) - 1),
         "outline_area_m2": round(float(poly.area), 2),
         "outline_perimeter_m": round(float(poly.length), 2),
+        "raster_grid_m": RASTER_GRID,
+        "simplify_tol_m": SIMPLIFY_TOL,
         "outline_vertices_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in coords[:-1]],
-        "rotated_rect_area_m2": round(float(rect.area), 2),
-        "rotated_rect_vertices_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in rcoords[:-1]],
     }
-    plot_result(pts, poly, rect, "%s/%s_外轮廓.png" % (out_dir, base),
-                "%s 规则外轮廓" % base)
+    plot_result(pts, poly, "%s/%s_外轮廓.png" % (out_dir, base), "%s 贴合外墙轮廓线" % base)
     with open("%s/%s_外轮廓.json" % (out_dir, base), "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
-    print("外轮廓顶点=%d, 面积=%.1f m², 周长=%.1f m, 顶点/矩形见 json" %
+    print("轮廓线顶点=%d, 面积=%.1f m², 周长=%.1f m" %
           (info["outline_vertices"], info["outline_area_m2"], info["outline_perimeter_m"]))
     return info
 
@@ -120,7 +137,6 @@ def main():
     summary = {}
     for ply in sys.argv[1:]:
         base = os.path.splitext(os.path.basename(ply))[0]
-        # base 形如 "CLEAN_UNDER_GROUND_wall"，去掉 _wall 后缀
         base = base.replace("_wall", "") if base.endswith("_wall") else base
         summary[base] = process(base, ply, out_dir)
     with open(os.path.join(out_dir, "外轮廓_汇总.json"), "w", encoding="utf-8") as f:
