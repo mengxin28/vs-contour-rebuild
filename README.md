@@ -53,9 +53,9 @@ python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 - `外轮廓_汇总.json`
 
 外圈高亮（`outer.py`），每个原始 `NAME.ply` 生成：
-- `NAME_外圈点云.png` —— 红=外圈墙点(连续细带，距外边界≤`BAND`)，橙=高密度内部柱(被剔除)，浅蓝=其余
-- 竖直密度(`COL_GRID`)用于标识内部柱；红环由外圈位置(`BAND`)驱动，保证细且连续
-- 参数：`COL_GRID=0.3`、`GRID=0.5`、`PCT=95`、`BAND=0.8`
+- `NAME_外圈点云.png` —— 红=外圈墙点(双重密度门槛+外圈位置)，橙=双重高密度但不在外圈(内部柱)，浅蓝=其余
+- 双密度门槛：**全局前5%**(`GLOBAL_PCT=95`) 且 **局域前10%**(`LOCAL_PCT=90`/`LOCAL_CELL=12`)，再 AND 距外边界≤`BAND`
+- 密度=竖直堆叠密度(0.3m XY柱内点数)；参数 `COL_GRID=0.3`、`GRID=0.5`、`BAND=1.0`
 
 ## 版本历史
 每版的功能、用法与用户评价见 `版本记录.md`。

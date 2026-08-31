@@ -30,11 +30,13 @@ try:
 except Exception:
     pass
 
-COL_GRID = 0.3   # 竖直密度小柱边(m)
-GRID = 0.5       # 外圈位置栅格边(m)
+COL_GRID = 0.3    # 竖直密度小柱边(m)
+GRID = 0.5        # 外圈位置栅格边(m)
 CLOSE_ITER = 2
-PCT = 95         # 密度百分位：用于标识内部高密度柱(橙色)
-BAND = 0.8       # 外圈带宽(m)：红环=距外边界≤该值的连续细带
+GLOBAL_PCT = 95   # 全局密度百位分：≥95% 为"全局前5%"
+LOCAL_PCT = 90    # 局域密度百位分：≥该局部区域90% 为"局域前10%"
+LOCAL_CELL = 12.0 # 局域比较窗口边长(m)
+BAND = 1.0        # 外圈带宽(m)
 
 
 def read_xyz(ply_path):
@@ -57,16 +59,28 @@ def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
     return mask, g, (float(x0), float(y0)), grid
 
 
-def classify(raw, pct=PCT, band=BAND):
-    """返回红/橙布尔掩码（与 raw 对齐）。"""
+def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
+             local_cell=LOCAL_CELL, band=BAND):
+    """标记条件 = 局域前local_pct% AND 全局前global_pct% AND 外圈位置。
+    返回 (red, orange, info)。"""
     xy = raw[:, :2]
     # 1) 竖直堆叠密度：同 0.3m XY 柱内点数
     cell = np.floor(xy / COL_GRID).astype(np.int64)
     key = cell[:, 0] * 100000 + cell[:, 1]
     _, inv, counts = np.unique(key, return_inverse=True, return_counts=True)
     density = counts[inv].astype(np.float64)
-    thresh = np.percentile(density, pct)
-    high = density >= thresh
+    # 全局前5%
+    global_thr = np.percentile(density, global_pct)
+    global_top = density >= global_thr
+    # 局域前10%：以 12m 网格为"局部区域"，点密度≥该区域90分位
+    lc = np.floor(xy / local_cell).astype(np.int64)
+    lkey = lc[:, 0] * 1000000 + lc[:, 1]
+    _, linv = np.unique(lkey, return_inverse=True)
+    local_top = np.zeros(len(xy), dtype=bool)
+    for ci in np.unique(linv):
+        idx = np.where(linv == ci)[0]
+        local_top[idx] = density[idx] >= np.percentile(density[idx], local_pct)
+    dual = global_top & local_top       # 全局前5% 且 局域前10%
     # 2) 外圈位置：到外边界距离
     mask, g, (x0, y0), grid = footprint_mask(xy)
     dist_cells = distance_transform_edt(mask)
@@ -75,10 +89,12 @@ def classify(raw, pct=PCT, band=BAND):
            (g[:, 1] >= 0) & (g[:, 1] < mask.shape[0]))
     d = np.zeros(len(xy))
     d[inb] = dist_cells[g[inb, 1], g[inb, 0]]
-    outer = inb & (d <= band_cells)   # 连续细外圈带（来自填充footprint边界，无断口）
-    red = outer                       # 红环：细外圈带连续；内部柱因远离边界自动被剔除
-    orange = high & ~outer            # 橙色：高密度但不在外圈 = 内部密集柱
-    return red, orange, int(thresh)
+    outer = inb & (d <= band_cells)
+    red = dual & outer                  # 双密度门槛 且 在外圈
+    orange = dual & ~outer              # 双密度门槛 但不在外圈
+    info = {"global_thr": int(global_thr), "global_top": int(global_top.sum()),
+            "dual": int((dual).sum()), "red": int(red.sum()), "orange": int(orange.sum())}
+    return red, orange, info
 
 
 def plot(raw, red, orange, path, title):
@@ -107,11 +123,13 @@ def plot(raw, red, orange, path, title):
 def process(base, ply, out_dir):
     print("\n========== 外圈高亮(原始点竖直密度+位置): %s ==========" % ply)
     raw = read_xyz(ply)
-    red, orange, thresh = classify(raw)
+    red, orange, info = classify(raw)
     plot(raw, red, orange, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
     n = len(raw)
-    print("竖直密度阈值=%d 点/%s m柱; 红(外圈墙,细带≤%.1fm)=%d (%.1f%%); 橙(高密度内部柱)=%d" % (
-        thresh, COL_GRID, BAND, int(red.sum()), 100 * red.sum() / n, int(orange.sum())))
+    print("全局密度阈值=%d点/柱; 全局前%.0f%%=%d点; 双重(全局前%.0f%%且局域前%.0f%%)=%d点; "
+          "红(外圈墙)=%d (%.1f%%); 橙(双密度但不在外圈)=%d" % (
+              info["global_thr"], GLOBAL_PCT, info["global_top"], GLOBAL_PCT, LOCAL_PCT,
+              info["dual"], info["red"], 100 * info["red"] / n, info["orange"]))
 
 
 def main():
