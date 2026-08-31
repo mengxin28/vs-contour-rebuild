@@ -27,6 +27,9 @@ python code/preprocess.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 
 # 阶段二：贴合外墙轮廓线提取（读阶段一的 *_wall.ply）
 python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.ply
+
+# 阶段二（可视化）：外圈高密度点云高亮（红色外墙环，不描轮廓）
+python code/outer.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.ply
 ```
 
 默认参数：降采样 `0.5m`、密度栅格 `0.3m`（见 `code/preprocess.py` 顶部常量
@@ -48,6 +51,9 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 - `NAME_外轮廓.png` —— 墙点散点 + 规则化外轮廓(红粗线) + 贴合外沿原始线(灰)
 - `NAME_外轮廓.json` —— 轮廓线顶点坐标、面积、周长（含栅格/容差参数）
 - `外轮廓_汇总.json`
+
+外圈高亮（`outer.py`），每个 `NAME_wall.ply` 生成：
+- `NAME_外圈点云.png` —— 红=外侧高密度点(外墙环)，蓝=内部/其余点
 
 ## 版本历史
 每版的功能、用法与用户评价见 `版本记录.md`。
