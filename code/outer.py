@@ -33,8 +33,8 @@ except Exception:
 COL_GRID = 0.3   # 竖直密度小柱边(m)
 GRID = 0.5       # 外圈位置栅格边(m)
 CLOSE_ITER = 2
-PCT = 95         # 密度百分位：前5%判为高密度
-BAND = 1.5       # 外圈带宽(m)
+PCT = 95         # 密度百分位：用于标识内部高密度柱(橙色)
+BAND = 0.8       # 外圈带宽(m)：红环=距外边界≤该值的连续细带
 
 
 def read_xyz(ply_path):
@@ -75,9 +75,9 @@ def classify(raw, pct=PCT, band=BAND):
            (g[:, 1] >= 0) & (g[:, 1] < mask.shape[0]))
     d = np.zeros(len(xy))
     d[inb] = dist_cells[g[inb, 1], g[inb, 0]]
-    outer = inb & (d <= band_cells)
-    red = high & outer
-    orange = high & ~outer
+    outer = inb & (d <= band_cells)   # 连续细外圈带（来自填充footprint边界，无断口）
+    red = outer                       # 红环：细外圈带连续；内部柱因远离边界自动被剔除
+    orange = high & ~outer            # 橙色：高密度但不在外圈 = 内部密集柱
     return red, orange, int(thresh)
 
 
@@ -110,8 +110,8 @@ def process(base, ply, out_dir):
     red, orange, thresh = classify(raw)
     plot(raw, red, orange, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
     n = len(raw)
-    print("竖直密度阈值=%d 点/%s m柱; 高密度前%.0f%%=%d点; 红(外圈高密度墙)=%d (%.1f%%); 橙(密但不在外圈)=%d" % (
-        thresh, COL_GRID, PCT, int((red | orange).sum()), int(red.sum()), 100 * red.sum() / n, int(orange.sum())))
+    print("竖直密度阈值=%d 点/%s m柱; 红(外圈墙,细带≤%.1fm)=%d (%.1f%%); 橙(高密度内部柱)=%d" % (
+        thresh, COL_GRID, BAND, int(red.sum()), 100 * red.sum() / n, int(orange.sum())))
 
 
 def main():
