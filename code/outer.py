@@ -33,7 +33,7 @@ except Exception:
 COL_GRID = 0.3    # 竖直密度小柱边(m)
 GRID = 0.5        # 外圈位置栅格边(m)
 CLOSE_ITER = 2
-GLOBAL_PCT = 95   # 全局密度百位分：≥95% 为"全局前5%"
+GLOBAL_PCT = 90   # 全局密度百位分：≥90% 为"全局前10%"
 LOCAL_PCT = 90    # 局域密度百位分：≥该局部区域90% 为"局域前10%"
 LOCAL_CELL = 12.0 # 局域比较窗口边长(m)
 BAND = 1.0        # 外圈带宽(m)
