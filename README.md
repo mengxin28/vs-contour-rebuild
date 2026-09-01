@@ -31,6 +31,9 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 # 阶段二（可视化）：高密度点云标注（红=外圈高密度墙点，支持 .las/.ply）
 python code/outer.py 粟塘B1.las 雅德B1.las
 python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
+
+# 阶段三：正交轮廓（wall.ply 连线 + snap_1d 直角化）
+python code/outline.py 输出/粟塘B1_wall.ply 输出/雅德B1_wall.ply
 ```
 
 默认参数：输出/几何降采样 `0.1m`（`VOXEL`），结构连通用 `0.5m`（`CONN_VOXEL`），密度栅格 `0.3m`
