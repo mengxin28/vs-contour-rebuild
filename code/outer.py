@@ -99,13 +99,17 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
     global_thr = np.percentile(density, global_pct)
     global_top = density >= global_thr
     # 局域前10%：以 12m 网格为"局部区域"，点密度≥该区域90分位
+    # (排序分组再求分位，避免逐区域 np.where 的 O(N×区域) 慢循环)
     lc = np.floor(xy / local_cell).astype(np.int64)
     lkey = lc[:, 0] * 1000000 + lc[:, 1]
-    _, linv = np.unique(lkey, return_inverse=True)
-    local_top = np.zeros(len(xy), dtype=bool)
-    for ci in np.unique(linv):
-        idx = np.where(linv == ci)[0]
-        local_top[idx] = density[idx] >= np.percentile(density[idx], local_pct)
+    order = np.argsort(lkey, kind="stable")
+    start = np.unique(lkey[order], return_index=True)[1]
+    N = len(xy)
+    local_top = np.zeros(N, dtype=bool)
+    for k, s in enumerate(start):
+        e = start[k + 1] if k + 1 < len(start) else N
+        ids = order[s:e]
+        local_top[ids] = density[ids] >= np.percentile(density[ids], local_pct)
     dual = global_top & local_top       # 全局前10% 且 局域前10%
     # 2) 外圈位置：到外边界距离
     mask, g, (x0, y0), grid = footprint_mask(xy)
@@ -123,9 +127,13 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
     return red, orange, info
 
 
-def plot(raw, red, orange, path, title):
+def plot(raw, red, orange, path, title, max_pts=2_000_000):
+    """点染；大点云对"其余点"抽样以提速。"""
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(raw[~red, 0], raw[~red, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
+    rest = np.where(~red)[0]
+    if len(rest) > max_pts:                     # 抽样背景点，红/橙全保留
+        rest = rest[::2 * len(rest) // max_pts]
+    ax.scatter(raw[rest, 0], raw[rest, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
     ax.scatter(raw[orange, 0], raw[orange, 1], s=0.9, c="#ff7f0e", marker=".", alpha=0.85,
                label="高密度但不在外圈")
     ax.scatter(raw[red, 0], raw[red, 1], s=1.2, c="#d62728", marker=".", alpha=0.95,
