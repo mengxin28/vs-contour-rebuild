@@ -53,8 +53,9 @@ python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 - `外轮廓_汇总.json`
 
 外圈高亮（`outer.py`），每个原始 `NAME.ply` 生成：
-- `NAME_外圈点云.png` —— 红=外圈墙点(双重密度门槛+外圈位置)，橙=双重高密度但不在外圈(内部柱)，浅蓝=其余
+- `NAME_外圈点云.png` —— 红=外圈墙点，橙=双重高密度但不在外圈(内部柱)，紫=墙外噪声(已剔除)，浅蓝=其余
 - 双密度门槛：**全局前10%**(`GLOBAL_PCT=90`) 且 **局域前10%**(`LOCAL_PCT=90`/`LOCAL_CELL=12`)，再 AND 距外边界≤`BAND`
+- 连通域过滤：只保留最大连通块(`KEEP_ONLY_BIGGEST`)，剔除脱离主体的墙外噪声
 - 密度=竖直堆叠密度(0.3m XY柱内点数)；参数 `COL_GRID=0.3`、`GRID=0.5`、`BAND=1.0`
 
 ## 版本历史

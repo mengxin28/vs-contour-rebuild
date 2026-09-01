@@ -18,7 +18,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.ndimage import binary_closing, binary_fill_holes, distance_transform_edt
+from scipy.ndimage import binary_closing, binary_fill_holes, distance_transform_edt, label
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -37,6 +37,7 @@ GLOBAL_PCT = 90   # 全局密度百位分：≥90% 为"全局前10%"
 LOCAL_PCT = 90    # 局域密度百位分：≥该局部区域90% 为"局域前10%"
 LOCAL_CELL = 12.0 # 局域比较窗口边长(m)
 BAND = 1.0        # 外圈带宽(m)
+KEEP_ONLY_BIGGEST = True  # 只保留最大连通块，剔除脱离主体的噪声点/块
 
 
 def read_xyz(ply_path):
@@ -48,6 +49,7 @@ def read_xyz(ply_path):
 
 
 def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
+    """生成主footprint栅格；只保留最大连通块，剔除脱离主体的噪声点/块。"""
     x0, y0 = xy.min(axis=0)
     g = np.floor((xy - [x0, y0]) / grid).astype(np.int64)
     nx, ny = int(g[:, 0].max()) + 1, int(g[:, 1].max()) + 1
@@ -56,6 +58,12 @@ def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
     if close_iter:
         mask = binary_closing(mask, structure=np.ones((3, 3), dtype=bool), iterations=close_iter)
     mask = binary_fill_holes(mask)
+    if KEEP_ONLY_BIGGEST:
+        lab, nlab = label(mask)
+        if nlab > 1:
+            sizes = np.bincount(lab.ravel())
+            sizes[0] = 0
+            mask = lab == int(sizes.argmax())
     return mask, g, (float(x0), float(y0)), grid
 
 
@@ -80,28 +88,31 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
     for ci in np.unique(linv):
         idx = np.where(linv == ci)[0]
         local_top[idx] = density[idx] >= np.percentile(density[idx], local_pct)
-    dual = global_top & local_top       # 全局前5% 且 局域前10%
-    # 2) 外圈位置：到外边界距离
+    dual = global_top & local_top       # 全局前10% 且 局域前10%
+    # 2) 主 footprint + 外圈位置
     mask, g, (x0, y0), grid = footprint_mask(xy)
-    dist_cells = distance_transform_edt(mask)
-    band_cells = band / grid
-    inb = ((g[:, 0] >= 0) & (g[:, 0] < mask.shape[1]) &
-           (g[:, 1] >= 0) & (g[:, 1] < mask.shape[0]))
-    d = np.zeros(len(xy))
-    d[inb] = dist_cells[g[inb, 1], g[inb, 0]]
-    outer = inb & (d <= band_cells)
-    red = dual & outer                  # 双密度门槛 且 在外圈
-    orange = dual & ~outer              # 双密度门槛 但不在外圈
+    dist_cells = distance_transform_edt(mask)          # 主块内的点到其外边界距离
+    in_keep = mask[g[:, 1], g[:, 0]]                   # 是否落在"主 footprint 内"
+    d = np.full(len(xy), 1e9, dtype=np.float64)        # 主块外=无穷大
+    d[in_keep] = dist_cells[g[in_keep, 1], g[in_keep, 0]]
+    outer = in_keep & (d <= band / grid)
+    red = dual & outer                  # 双密度门槛 且 在主外圈
+    orange = dual & in_keep & ~outer    # 双密度门槛 但主内但非外圈(内部柱)
+    noise = ~in_keep                    # 落在被剔除噪声块的点 -> 已剔除噪声
     info = {"global_thr": int(global_thr), "global_top": int(global_top.sum()),
-            "dual": int((dual).sum()), "red": int(red.sum()), "orange": int(orange.sum())}
-    return red, orange, info
+            "dual": int(dual.sum()), "red": int(red.sum()), "orange": int(orange.sum()),
+            "noise": int(noise.sum())}
+    return red, orange, noise, info
 
 
-def plot(raw, red, orange, path, title):
+def plot(raw, red, orange, noise, path, title):
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(raw[~red, 0], raw[~red, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
+    other = ~(red | orange | noise)
+    ax.scatter(raw[other, 0], raw[other, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
+    ax.scatter(raw[noise, 0], raw[noise, 1], s=0.7, c="#9467bd", marker=".", alpha=0.8,
+               label="墙外噪声(已剔除)")
     ax.scatter(raw[orange, 0], raw[orange, 1], s=0.9, c="#ff7f0e", marker=".", alpha=0.85,
-               label="高密度但不在外圈")
+               label="高密度但不在外圈(内部柱)")
     ax.scatter(raw[red, 0], raw[red, 1], s=1.2, c="#d62728", marker=".", alpha=0.95,
                label="外圈高密度点(外墙)")
     ax.legend(loc="best", markerscale=6)
@@ -123,13 +134,13 @@ def plot(raw, red, orange, path, title):
 def process(base, ply, out_dir):
     print("\n========== 外圈高亮(原始点竖直密度+位置): %s ==========" % ply)
     raw = read_xyz(ply)
-    red, orange, info = classify(raw)
-    plot(raw, red, orange, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
+    red, orange, noise, info = classify(raw)
+    plot(raw, red, orange, noise, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
     n = len(raw)
-    print("全局密度阈值=%d点/柱; 全局前%.0f%%=%d点; 双重(全局前%.0f%%且局域前%.0f%%)=%d点; "
-          "红(外圈墙)=%d (%.1f%%); 橙(双密度但不在外圈)=%d" % (
-              info["global_thr"], GLOBAL_PCT, info["global_top"], GLOBAL_PCT, LOCAL_PCT,
-              info["dual"], info["red"], 100 * info["red"] / n, info["orange"]))
+    print("全局密度阈值=%d点/柱; 双重(全局前%.0f%%且局域前%.0f%%)=%d点; 红(外墙)=%d (%.1f%%); "
+          "橙(内部柱)=%d; 墙外噪声(已剔除)=%d" % (
+              info["global_thr"], GLOBAL_PCT, LOCAL_PCT, info["dual"],
+              info["red"], 100 * info["red"] / n, info["orange"], info["noise"]))
 
 
 def main():
