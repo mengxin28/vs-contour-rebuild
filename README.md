@@ -59,7 +59,7 @@ python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 - `NAME_高密度单元.png` —— 0.1m 格高密度单元标注：红=高密度格(局域前5%且全局前10%)，浅蓝=普通占用格，白=空格（不描轮廓）
 - 双密度门槛：**全局前10%**(`GLOBAL_PCT=90`) 且 **局域前10%**(`LOCAL_PCT=90`/`LOCAL_CELL=12`)，再 AND 距外边界≤`BAND`
 - 连通域过滤：只保留最大连通块(`KEEP_ONLY_BIGGEST`)，剔除脱离主体的墙外噪声
-- 密度=竖直堆叠密度(0.3m XY柱内点数)；参数 `COL_GRID=0.3`、`GRID=0.5`、`BAND=1.0`
+- 密度=竖直堆叠密度(0.1m XY柱内点数)；参数 `COL_GRID=0.1`、`GRID=0.5`、`BAND=1.0`
 
 ## 版本历史
 每版的功能、用法与用户评价见 `版本记录.md`。

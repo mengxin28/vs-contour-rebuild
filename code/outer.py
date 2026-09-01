@@ -31,7 +31,7 @@ try:
 except Exception:
     pass
 
-COL_GRID = 0.3    # 竖直密度小柱边(m)
+COL_GRID = 0.1    # 竖直密度小柱边(m)（基本单元 0.1m×0.1m）
 GRID = 0.5        # 外圈位置栅格边(m)
 CLOSE_ITER = 2
 GLOBAL_PCT = 90   # 全局密度百位分：≥90% 为"全局前10%"
