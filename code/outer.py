@@ -38,6 +38,7 @@ LOCAL_PCT = 90    # 局域密度百位分：≥该局部区域90% 为"局域前1
 LOCAL_CELL = 12.0 # 局域比较窗口边长(m)
 BAND = 1.0        # 外圈带宽(m)
 KEEP_ONLY_BIGGEST = True  # 只保留最大连通块，剔除脱离主体的噪声点/块
+CELL = 0.1        # 高密度单元栅格边(m)：标注"高密度点云单元"用的格子大小
 
 
 def read_xyz(ply_path):
@@ -131,6 +132,65 @@ def plot(raw, red, orange, noise, path, title):
     plt.close(fig)
 
 
+def mark_high_density_cells(xy, cell=CELL, global_pct=GLOBAL_PCT,
+                            local_pct=LOCAL_PCT, local_cell=LOCAL_CELL):
+    """把高密度点云"单元(格子)"标出来。返回 (标记布尔网格 m2[nrow,ncol], extent, 高密格数)。"""
+    c = np.floor(xy / cell).astype(np.int64)
+    uni, inv, counts = np.unique(c, axis=0, return_inverse=True, return_counts=True)
+    counts = counts.astype(np.float64)
+    # 全局前global_pct%
+    global_thr = np.percentile(counts, global_pct)
+    global_dense = counts >= global_thr
+    # 局域前local_pct%（按 local_cell 网格分区域）
+    uc = uni * cell                                     # 每格左下角(m)
+    rid = np.floor(uc[:, 1] / local_cell).astype(np.int64) * 1000000 \
+        + np.floor(uc[:, 0] / local_cell).astype(np.int64)
+    _, rinv = np.unique(rid, return_inverse=True)
+    local_dense = np.zeros(len(counts), dtype=bool)
+    for rci in np.unique(rinv):
+        idx = np.where(rinv == rci)[0]
+        local_dense[idx] = counts[idx] >= np.percentile(counts[idx], local_pct)
+    marked_cell = global_dense & local_dense
+    # 映射到 2D 网格
+    minx, miny = xy[:, 0].min(), xy[:, 1].min()
+    nx = int(np.ceil((xy[:, 0].max() - minx) / cell)) + 1
+    ny = int(np.ceil((xy[:, 1].max() - miny) / cell)) + 1
+    gx = np.floor((uc[:, 0] - minx) / cell).astype(np.int64)
+    gy = np.floor((uc[:, 1] - miny) / cell).astype(np.int64)
+    m2 = np.zeros((ny, nx), dtype=bool)             # 高密度格(红)
+    mp = np.zeros((ny, nx), dtype=bool)             # 有数据的格(浅蓝)
+    inb = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+    mp[gy[inb], gx[inb]] = True
+    ok = marked_cell & inb
+    m2[gy[ok], gx[ok]] = True
+    extent = (minx, minx + nx * cell, miny, miny + ny * cell)
+    return m2, mp, extent, int(marked_cell.sum())
+
+
+def plot_cells(m2, mp, extent, path, title):
+    """标注高密度单元（纯格子视图）：红=高密度格，浅蓝=低密度格，白=空格。
+    用较高 dpi 让 0.1m 的格子可分辨成方块。"""
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ny, nx = m2.shape
+    rgba = np.zeros((ny, nx, 4), dtype=float)
+    rgba[mp] = [0.72, 0.82, 0.93, 0.75]             # 低密度/普通占用格 -> 浅蓝
+    rgba[m2] = [0.86, 0.15, 0.15, 1.0]              # 高密度单元 -> 红
+    ax.imshow(rgba, extent=extent, origin="lower", aspect="equal",
+              interpolation="nearest")
+    x0, x1 = extent[0], extent[1]
+    y0, y1 = extent[2], extent[3]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    half = max(x1 - x0, y1 - y0) / 2 * 1.02
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_title(title)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+
+
 def process(base, ply, out_dir):
     print("\n========== 外圈高亮(原始点竖直密度+位置): %s ==========" % ply)
     raw = read_xyz(ply)
@@ -141,6 +201,13 @@ def process(base, ply, out_dir):
           "橙(内部柱)=%d; 墙外噪声(已剔除)=%d" % (
               info["global_thr"], GLOBAL_PCT, LOCAL_PCT, info["dual"],
               info["red"], 100 * info["red"] / n, info["orange"], info["noise"]))
+
+    # 高密度点云"单元"标注：0.1m 格内数点数分高低密度；高密度=局域前5%且全局前10%(不描轮廓)
+    m2, mp, extent, ncells = mark_high_density_cells(raw[:, :2],
+                                                     global_pct=GLOBAL_PCT, local_pct=95)
+    plot_cells(m2, mp, extent, "%s/%s_高密度单元.png" % (out_dir, base),
+               "%s 高密度点云单元(红, %.1fm格)" % (base, CELL))
+    print("高密度单元: 红格=%d (格子 %.1fm; 全局前%.0f%%且局域前5%%)" % (ncells, CELL, GLOBAL_PCT))
 
 
 def main():
