@@ -33,7 +33,7 @@ except Exception:
 # 用户版"连线规则"参数
 GRID_SIZE = 0.3      # 网格
 BRIDGE_DIST = 1.5    # 搭桥缝合距离
-FLATTEN_TOL = 3.0    # 一维聚类拉平容差(线必须水平/竖直)
+FLATTEN_TOL = 5.0    # 一维聚类拉平容差(线必须水平/竖直)(调大并干净台阶)
 MORPH = 0.0          # 形态学滤毛刺半径(用户版 buffer(-r).buffer(r))；红点是细墙环，设0避免被削没
 ORIENT_THRESH = 8.0  # 主方向角度阈值(°)：小 => 世界系水平/竖直；大 => 主方向系正交(斜着但线线90°)
 
