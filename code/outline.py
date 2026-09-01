@@ -35,6 +35,7 @@ GRID_SIZE = 0.3      # 网格
 BRIDGE_DIST = 1.5    # 搭桥缝合距离
 FLATTEN_TOL = 3.0    # 一维聚类拉平容差(线必须水平/竖直)
 MORPH = 0.0          # 形态学滤毛刺半径(用户版 buffer(-r).buffer(r))；红点是细墙环，设0避免被削没
+ORIENT_THRESH = 8.0  # 主方向角度阈值(°)：小 => 世界系水平/竖直；大 => 主方向系正交(斜着但线线90°)
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
 SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
@@ -126,17 +127,32 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
         fused = fused.buffer(-morph, join_style=2).buffer(morph, join_style=2)
     if hasattr(fused, "geoms"):
         fused = max(fused.geoms, key=lambda p: p.area)
-    raw_coords = np.array(fused.exterior.coords)
-    sx = snap_1d_coordinates(raw_coords[:, 0], tol=flatten_tol)
-    sy = snap_1d_coordinates(raw_coords[:, 1], tol=flatten_tol)
-    snapped = np.column_stack([sx, sy])
+    raw_coords = np.array(fused.exterior.coords)[:-1]
+    # 自动抉择：主方向角度小(轴对齐) => 世界系水平/竖直；角度大(整体倾斜) => 主方向系正交(线线90°)
+    rc = np.asarray(fused.minimum_rotated_rectangle.exterior.coords)
+    d = rc[1] - rc[0]
+    ang = math.atan2(d[1], d[0]) % (math.pi / 2)
+    if ang > math.pi / 4:
+        ang -= math.pi / 2
+    c = raw_coords.mean(axis=0)
+    if abs(ang) <= math.radians(ORIENT_THRESH):
+        ang = 0.0                                       # 轴对齐建筑：世界系水平/竖直
+    if ang == 0.0:
+        sx = snap_1d_coordinates(raw_coords[:, 0], tol=flatten_tol)
+        sy = snap_1d_coordinates(raw_coords[:, 1], tol=flatten_tol)
+        back = np.column_stack([sx, sy])
+    else:
+        rot = _rotate(raw_coords, -ang, c)              # 转到主方向(墙对齐轴)
+        sx = snap_1d_coordinates(rot[:, 0], tol=flatten_tol)
+        sy = snap_1d_coordinates(rot[:, 1], tol=flatten_tol)
+        back = _rotate(np.column_stack([sx, sy]), ang, c)  # 转回：斜着但线线正交
     try:
-        clean_poly = Polygon(snapped).buffer(0)
+        clean_poly = Polygon(np.vstack([back, back[:1]])).buffer(0)
         if clean_poly.geom_type == "MultiPolygon":
             clean_poly = max(clean_poly.geoms, key=lambda p: p.area)
         final = np.array(clean_poly.exterior.coords)
     except Exception:
-        final = snapped
+        final = np.vstack([back, back[:1]])
     return remove_collinear_points(final)
 
 
