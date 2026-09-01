@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 地下车库 外圈高密度点云高亮（阶段二·可视化，v0.7 密度用原始点）
-输入：原始点云 `*.ply`（CLEAN_UNDER_GROUND.ply / RESULT_B1.ply）。
+输入：原始点云 `*.las` / `*.ply`。
 目标：把**外圈高密度墙体点**用红色标出（不描轮廓）。
 密度定义：**竖直堆叠密度** —— 同一 0.3m XY 小柱内的点数。墙体/柱在竖直方向叠满、密度高；
          地面/天花板只在顶底各一层、密度低。故"密度前5%"能聚到墙/柱。
 判定 = 两者结合：竖直密度 前5%  AND  距外边界 ≤ BAND。
 输出：`*_外圈点云.png`（红=外圈高密度墙，橙=高密度但不在外圈，浅蓝=其余）。
 用法：
-    python outer.py <原始.ply ...>
+    python outer.py <原始.las/.ply ...>
 例如：
-    python outer.py ../CLEAN_UNDER_GROUND.ply ../RESULT_B1.ply
+    python outer.py ../粟塘B1.las ../雅德B1.las
 """
 import os
 import sys
+import struct
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.ndimage import binary_closing, binary_fill_holes, distance_transform_edt, label
+from scipy.ndimage import binary_closing, binary_fill_holes, distance_transform_edt
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -37,20 +38,42 @@ GLOBAL_PCT = 90   # 全局密度百位分：≥90% 为"全局前10%"
 LOCAL_PCT = 90    # 局域密度百位分：≥该局部区域90% 为"局域前10%"
 LOCAL_CELL = 12.0 # 局域比较窗口边长(m)
 BAND = 1.0        # 外圈带宽(m)
-KEEP_ONLY_BIGGEST = True  # 只保留最大连通块，剔除脱离主体的噪声点/块
-CELL = 0.1        # 高密度单元栅格边(m)：标注"高密度点云单元"用的格子大小
 
 
-def read_xyz(ply_path):
-    pcd = o3d.io.read_point_cloud(ply_path)
+def read_las_xyz(path, chunk=2_000_000):
+    """自写 LAS 读取（未压缩 LAS 1.x），返回 (N,3) float64 米制坐标。"""
+    with open(path, "rb") as fh:
+        d = fh.read(400)
+    assert d[0:4] == b"LASF", "不是有效 LAS: %s" % path
+    off = struct.unpack("<I", d[96:100])[0]
+    pt_len = d[105]
+    sx, sy, sz = struct.unpack("<d", d[131:139])[0], struct.unpack("<d", d[139:147])[0], struct.unpack("<d", d[147:155])[0]
+    ox, oy, oz = struct.unpack("<d", d[155:163])[0], struct.unpack("<d", d[163:171])[0], struct.unpack("<d", d[171:179])[0]
+    rec = np.dtype({"names": ["X", "Y", "Z"], "formats": ["<i4", "<i4", "<i4"],
+                    "offsets": [0, 4, 8], "itemsize": pt_len})
+    total = (os.path.getsize(path) - off) // pt_len
+    out, pos = [], 0
+    while pos < total:
+        n = min(chunk, total - pos)
+        r = np.fromfile(path, dtype=rec, count=n, offset=off + pos * pt_len)
+        out.append(np.column_stack([r["X"] * sx + ox, r["Y"] * sy + oy,
+                                    r["Z"] * sz + oz]).astype(np.float64))
+        pos += n
+    return np.vstack(out) if out else np.empty((0, 3))
+
+
+def read_xyz(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".las":
+        return read_las_xyz(path)
+    pcd = o3d.io.read_point_cloud(path)
     pts = np.asarray(pcd.points, dtype=np.float64)
     if pts.size == 0:
-        raise ValueError("空点云: %s" % ply_path)
+        raise ValueError("空点云: %s" % path)
     return pts
 
 
 def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
-    """生成主footprint栅格；只保留最大连通块，剔除脱离主体的噪声点/块。"""
     x0, y0 = xy.min(axis=0)
     g = np.floor((xy - [x0, y0]) / grid).astype(np.int64)
     nx, ny = int(g[:, 0].max()) + 1, int(g[:, 1].max()) + 1
@@ -59,12 +82,6 @@ def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
     if close_iter:
         mask = binary_closing(mask, structure=np.ones((3, 3), dtype=bool), iterations=close_iter)
     mask = binary_fill_holes(mask)
-    if KEEP_ONLY_BIGGEST:
-        lab, nlab = label(mask)
-        if nlab > 1:
-            sizes = np.bincount(lab.ravel())
-            sizes[0] = 0
-            mask = lab == int(sizes.argmax())
     return mask, g, (float(x0), float(y0)), grid
 
 
@@ -78,7 +95,7 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
     key = cell[:, 0] * 100000 + cell[:, 1]
     _, inv, counts = np.unique(key, return_inverse=True, return_counts=True)
     density = counts[inv].astype(np.float64)
-    # 全局前5%
+    # 全局前10%
     global_thr = np.percentile(density, global_pct)
     global_top = density >= global_thr
     # 局域前10%：以 12m 网格为"局部区域"，点密度≥该区域90分位
@@ -90,30 +107,27 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
         idx = np.where(linv == ci)[0]
         local_top[idx] = density[idx] >= np.percentile(density[idx], local_pct)
     dual = global_top & local_top       # 全局前10% 且 局域前10%
-    # 2) 主 footprint + 外圈位置
+    # 2) 外圈位置：到外边界距离
     mask, g, (x0, y0), grid = footprint_mask(xy)
-    dist_cells = distance_transform_edt(mask)          # 主块内的点到其外边界距离
-    in_keep = mask[g[:, 1], g[:, 0]]                   # 是否落在"主 footprint 内"
-    d = np.full(len(xy), 1e9, dtype=np.float64)        # 主块外=无穷大
-    d[in_keep] = dist_cells[g[in_keep, 1], g[in_keep, 0]]
-    outer = in_keep & (d <= band / grid)
-    red = dual & outer                  # 双密度门槛 且 在主外圈
-    orange = dual & in_keep & ~outer    # 双密度门槛 但主内但非外圈(内部柱)
-    noise = ~in_keep                    # 落在被剔除噪声块的点 -> 已剔除噪声
+    dist_cells = distance_transform_edt(mask)
+    band_cells = band / grid
+    inb = ((g[:, 0] >= 0) & (g[:, 0] < mask.shape[1]) &
+           (g[:, 1] >= 0) & (g[:, 1] < mask.shape[0]))
+    d = np.zeros(len(xy))
+    d[inb] = dist_cells[g[inb, 1], g[inb, 0]]
+    outer = inb & (d <= band_cells)
+    red = dual & outer                  # 双密度门槛 且 在外圈
+    orange = dual & ~outer              # 双密度门槛 但不在外圈
     info = {"global_thr": int(global_thr), "global_top": int(global_top.sum()),
-            "dual": int(dual.sum()), "red": int(red.sum()), "orange": int(orange.sum()),
-            "noise": int(noise.sum())}
-    return red, orange, noise, info
+            "dual": int((dual).sum()), "red": int(red.sum()), "orange": int(orange.sum())}
+    return red, orange, info
 
 
-def plot(raw, red, orange, noise, path, title):
+def plot(raw, red, orange, path, title):
     fig, ax = plt.subplots(figsize=(9, 6))
-    other = ~(red | orange | noise)
-    ax.scatter(raw[other, 0], raw[other, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
-    ax.scatter(raw[noise, 0], raw[noise, 1], s=0.7, c="#9467bd", marker=".", alpha=0.8,
-               label="墙外噪声(已剔除)")
+    ax.scatter(raw[~red, 0], raw[~red, 1], s=0.3, c="#c6dbef", marker=".", alpha=0.5, label="其余点")
     ax.scatter(raw[orange, 0], raw[orange, 1], s=0.9, c="#ff7f0e", marker=".", alpha=0.85,
-               label="高密度但不在外圈(内部柱)")
+               label="高密度但不在外圈")
     ax.scatter(raw[red, 0], raw[red, 1], s=1.2, c="#d62728", marker=".", alpha=0.95,
                label="外圈高密度点(外墙)")
     ax.legend(loc="best", markerscale=6)
@@ -132,82 +146,16 @@ def plot(raw, red, orange, noise, path, title):
     plt.close(fig)
 
 
-def mark_high_density_cells(xy, cell=CELL, global_pct=GLOBAL_PCT,
-                            local_pct=LOCAL_PCT, local_cell=LOCAL_CELL):
-    """把高密度点云"单元(格子)"标出来。返回 (标记布尔网格 m2[nrow,ncol], extent, 高密格数)。"""
-    c = np.floor(xy / cell).astype(np.int64)
-    uni, inv, counts = np.unique(c, axis=0, return_inverse=True, return_counts=True)
-    counts = counts.astype(np.float64)
-    # 全局前global_pct%
-    global_thr = np.percentile(counts, global_pct)
-    global_dense = counts >= global_thr
-    # 局域前local_pct%（按 local_cell 网格分区域）
-    uc = uni * cell                                     # 每格左下角(m)
-    rid = np.floor(uc[:, 1] / local_cell).astype(np.int64) * 1000000 \
-        + np.floor(uc[:, 0] / local_cell).astype(np.int64)
-    _, rinv = np.unique(rid, return_inverse=True)
-    local_dense = np.zeros(len(counts), dtype=bool)
-    for rci in np.unique(rinv):
-        idx = np.where(rinv == rci)[0]
-        local_dense[idx] = counts[idx] >= np.percentile(counts[idx], local_pct)
-    marked_cell = global_dense & local_dense
-    # 映射到 2D 网格
-    minx, miny = xy[:, 0].min(), xy[:, 1].min()
-    nx = int(np.ceil((xy[:, 0].max() - minx) / cell)) + 1
-    ny = int(np.ceil((xy[:, 1].max() - miny) / cell)) + 1
-    gx = np.floor((uc[:, 0] - minx) / cell).astype(np.int64)
-    gy = np.floor((uc[:, 1] - miny) / cell).astype(np.int64)
-    m2 = np.zeros((ny, nx), dtype=bool)             # 高密度格(红)
-    mp = np.zeros((ny, nx), dtype=bool)             # 有数据的格(浅蓝)
-    inb = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
-    mp[gy[inb], gx[inb]] = True
-    ok = marked_cell & inb
-    m2[gy[ok], gx[ok]] = True
-    extent = (minx, minx + nx * cell, miny, miny + ny * cell)
-    return m2, mp, extent, int(marked_cell.sum())
-
-
-def plot_cells(m2, mp, extent, path, title):
-    """标注高密度单元（纯格子视图）：红=高密度格，浅蓝=低密度格，白=空格。
-    用较高 dpi 让 0.1m 的格子可分辨成方块。"""
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ny, nx = m2.shape
-    rgba = np.zeros((ny, nx, 4), dtype=float)
-    rgba[mp] = [0.72, 0.82, 0.93, 0.75]             # 低密度/普通占用格 -> 浅蓝
-    rgba[m2] = [0.86, 0.15, 0.15, 1.0]              # 高密度单元 -> 红
-    ax.imshow(rgba, extent=extent, origin="lower", aspect="equal",
-              interpolation="nearest")
-    x0, x1 = extent[0], extent[1]
-    y0, y1 = extent[2], extent[3]
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    half = max(x1 - x0, y1 - y0) / 2 * 1.02
-    ax.set_xlim(cx - half, cx + half)
-    ax.set_ylim(cy - half, cy + half)
-    ax.set_title(title)
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=300)
-    plt.close(fig)
-
-
 def process(base, ply, out_dir):
     print("\n========== 外圈高亮(原始点竖直密度+位置): %s ==========" % ply)
     raw = read_xyz(ply)
-    red, orange, noise, info = classify(raw)
-    plot(raw, red, orange, noise, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
+    red, orange, info = classify(raw)
+    plot(raw, red, orange, "%s/%s_外圈点云.png" % (out_dir, base), "%s 外圈高密度点云(红)" % base)
     n = len(raw)
-    print("全局密度阈值=%d点/柱; 双重(全局前%.0f%%且局域前%.0f%%)=%d点; 红(外墙)=%d (%.1f%%); "
-          "橙(内部柱)=%d; 墙外噪声(已剔除)=%d" % (
-              info["global_thr"], GLOBAL_PCT, LOCAL_PCT, info["dual"],
-              info["red"], 100 * info["red"] / n, info["orange"], info["noise"]))
-
-    # 高密度点云"单元"标注：0.1m 格内数点数分高低密度；高密度=局域前5%且全局前10%(不描轮廓)
-    m2, mp, extent, ncells = mark_high_density_cells(raw[:, :2],
-                                                     global_pct=GLOBAL_PCT, local_pct=95)
-    plot_cells(m2, mp, extent, "%s/%s_高密度单元.png" % (out_dir, base),
-               "%s 高密度点云单元(红, %.1fm格)" % (base, CELL))
-    print("高密度单元: 红格=%d (格子 %.1fm; 全局前%.0f%%且局域前5%%)" % (ncells, CELL, GLOBAL_PCT))
+    print("全局密度阈值=%d点/柱; 全局前%.0f%%=%d点; 双重(全局前%.0f%%且局域前%.0f%%)=%d点; "
+          "红(外圈墙)=%d (%.1f%%); 橙(双密度但不在外圈)=%d" % (
+              info["global_thr"], GLOBAL_PCT, info["global_top"], GLOBAL_PCT, LOCAL_PCT,
+              info["dual"], info["red"], 100 * info["red"] / n, info["orange"]))
 
 
 def main():

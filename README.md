@@ -28,7 +28,8 @@ python code/preprocess.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 # 阶段二：贴合外墙轮廓线提取（读阶段一的 *_wall.ply）
 python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.ply
 
-# 阶段二（可视化）：外圈高密度点云高亮（红=外墙环，用原始点竖直密度+外圈位置）
+# 阶段二（可视化）：高密度点云标注（红=外圈高密度墙点，支持 .las/.ply）
+python code/outer.py 粟塘B1.las 雅德B1.las
 python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 ```
 
