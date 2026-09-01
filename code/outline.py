@@ -44,6 +44,7 @@ CORNER_EPS = 25.0    # 转角判据：原始转弯率|度| > 此值
 SMOOTH_W = 9         # 转弯率平滑窗宽
 SLANT_TOL = 2.0      # 斜线阈：偏离轴线(度)>=此值且长度>=SLANT_MIN_LEN 保留为斜线
 SLANT_MIN_LEN = 2.0  # 斜线最短长度(m)
+SLANT_RES_MAX = 0.8  # 斜线拟合最大残差(m)
 ARC_R_MIN = 5.0      # 圆弧半径下限(m)
 ARC_R_MAX = 200.0    # 圆弧半径上限(m)
 ARC_MIN_SPAN = 25.0  # 圆弧最小跨度(度)
@@ -244,8 +245,47 @@ def _smooth_ring(coords, iters=3, size=5):
     return c
 
 
+def enhance_slants(base, raw_b, min_edge_len=5.0):
+    """斜线检补（主攻斜交墙面）：遍历基底长边(≥5m)，取附近融合边界点拟合直线；
+    若该处边界确为斜线(偏离轴线≥SLANT_TOL、长度≥SLANT_MIN_LEN、残差≤0.6m)，
+    则用拟合斜线替换该边(端点投影到斜线上)。失败则原样保留。"""
+    n = len(base)
+    if n < 4:
+        return base
+    out = []
+    for i in range(n):
+        a, b_pt = base[i], base[(i + 1) % n]
+        e = b_pt - a
+        L = float(np.linalg.norm(e))
+        if L < min_edge_len:
+            out.append(a)
+            continue
+        d = e / L
+        # 取"该边直线附近(≤2.5m 走廊, 投影 t∈[-2,L+2])"的融合边界点
+        v = raw_b - a
+        t = v @ d
+        lat = np.abs(v[:, 0] * (-d[1]) + v[:, 1] * d[0])
+        sel = raw_b[(np.abs(lat) <= 2.5) & (t >= -2.0) & (t <= L + 2.0)]
+        out.append(a)
+        if len(sel) < 8:
+            continue
+        p0, d2 = fit_line(sel)
+        ang, dev, axis = _line_orient(d2)
+        v = sel - p0
+        tv = v @ d2
+        chain_len = float(tv.max() - tv.min())
+        res = float(np.abs((v @ d2) * 0 + np.linalg.norm(v - np.outer(tv, d2), axis=1)).max())
+        if dev >= SLANT_TOL and chain_len >= SLANT_MIN_LEN and res <= SLANT_RES_MAX:
+            a2 = p0 + float((a - p0) @ d2) * d2          # 端点投到斜线
+            b2 = p0 + float((b_pt - p0) @ d2) * d2
+            out.append(a2)
+            out.append(b2)
+    out = np.array(out)
+    return out if len(out) >= 4 else base
+
+
 def enhance_arcs_slants(base, raw, min_corner=40.0, max_corner=140.0):
-    """角上圆角(fillet)：遍历基底每个角，若角附近原始墙边能拟合出真实圆弧(R∈[5,200]、残差小、跨度足够)，
+    """[已停用-暂不主攻圆弧] 角上圆角(fillet)：遍历基底每个角，若角附近原始墙边能拟合出真实圆弧(R∈[5,200]、残差小、跨度足够)，
     则将角替换为"两切点之间"的圆弧采样；否则角度若为斜线(弦偏离轴线≥SLANT_TOL且长≥SLANT_MIN_LEN)则保留弦。
     失败/无特征则原样保留。raw: 融合边界(活动坐标系)。"""
     n = len(base)
@@ -346,9 +386,15 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
     except Exception:
         base = back
     base = remove_collinear_points(base)
-    # 2) 补丁：用"融合边界"(纯轮廓、无内部柱污染)拟合圆弧/小斜线并替换对应角（失败则原样保留基底）
+    # 2) 补丁：斜线检补（斜交墙面保留为直线；失败/无效则原样保留正交基底）
+    cp_base_area = float(Polygon(np.vstack([base, base[:1]])).area)
     try:
-        base = enhance_arcs_slants(base, frame)
+        enhanced = enhance_slants(base, frame)
+        p_enh = Polygon(np.vstack([enhanced, enhanced[:1]]))
+        if not p_enh.is_valid:
+            p_enh = p_enh.buffer(0)
+        if p_enh.geom_type == "Polygon" and 0.6 * cp_base_area <= p_enh.area <= 1.4 * cp_base_area:
+            base = enhanced
     except Exception:
         pass
     back = base if ang == 0.0 else _rotate(base, ang, c)
