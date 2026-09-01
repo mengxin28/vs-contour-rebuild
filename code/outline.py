@@ -50,7 +50,7 @@ ARC_MIN_SPAN = 25.0  # 圆弧最小跨度(度)
 ARC_RESIDUAL_MAX = 0.8  # 圆弧拟合最大残差(m)
 ARC_SAMPLES = 24     # 圆弧采样点数
 STAIR_LEN = 4.0      # 基底"台阶段"判定：短边长度阈值(m)
-PATCH_NEAR = 2.5     # 补丁拟合时取原始边界附近点的半径(m)
+PATCH_NEAR = 8.0     # 补丁拟合时取原始边界附近点的半径(m)(需覆盖真圆弧约等于R)
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
 SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
@@ -187,6 +187,19 @@ def fit_circle(pts):
     return cx, cy, R, float(resid.max())
 
 
+def fit_circle_trimmed(sel):
+    """带内点剔除的圆拟合：迭代去残差点，抗直墙点污染。"""
+    cx, cy, R, res = fit_circle(sel)
+    for _ in range(3):
+        d = np.abs(np.hypot(sel[:, 0] - cx, sel[:, 1] - cy) - R)
+        tol = max(res * 0.8, 0.6)
+        sel2 = sel[d <= tol]
+        if len(sel2) < 10:
+            break
+        cx, cy, R, res = fit_circle(sel2)
+    return cx, cy, R, float(res)
+
+
 def _corner_point(f1, f2, near):
     """相邻两特征求交点；失败返回 None。"""
     if f1[0] == "line" and f2[0] == "line":
@@ -216,9 +229,7 @@ def _line_circle_pt(p, d, circle, near):
     A = float(d @ d)
     B = 2.0 * float(d @ pc)
     C = float(pc @ pc) - R * R
-    disc = B * B - 4 * A * C
-    if disc < 0:
-        return None
+    disc = max(B * B - 4 * A * C, 0.0)   # 相切时浮点误差可为负，截断为0取切点
     sq = math.sqrt(disc)
     cands = [p + t_ * d for t_ in [(-B + sq) / (2 * A), (-B - sq) / (2 * A)]]
     return min(cands, key=lambda q: float(np.linalg.norm(q - near)))
@@ -254,34 +265,32 @@ def enhance_arcs_slants(base, raw, min_corner=40.0, max_corner=140.0):
         d1, d2 = e1 / l1, e2 / l2
         turn = math.degrees(math.atan2(d2[1], d2[0]) - math.atan2(d1[1], d1[0]))
         turn = (turn + 180.0) % 360.0 - 180.0
-        if abs(turn) < min_corner or abs(turn) > max_corner:
-            out.append(v)
-            continue
-        sel = raw[tree.query_ball_point(v, r=PATCH_NEAR)]
+        should_fillet = (abs(turn) >= min_corner and abs(turn) <= max_corner
+                         and l1 >= 6.0 and l2 >= 6.0)          # 只处理两邻边够长的真角
         is_arc = False
-        if len(sel) >= 8:
-            cx, cy, R, res = fit_circle(sel)
-            if ARC_R_MIN <= R <= ARC_R_MAX and res <= ARC_RESIDUAL_MAX:
-                j1 = _line_circle_pt_along(v, -d1, (cx, cy, R), v)   # 前一边方向(后退)
-                j2 = _line_circle_pt_along(v, d2, (cx, cy, R), v)    # 后一边方向(前进)
-                if j1 is not None and j2 is not None \
-                        and float(np.linalg.norm(j1 - v_prev)) <= l1 + 1.5 \
-                        and float(np.linalg.norm(j2 - v_next)) <= l2 + 1.5:
-                    a0 = math.atan2(j1[1] - cy, j1[0] - cx)
-                    a1 = math.atan2(j2[1] - cy, j2[0] - cx)
-                    da = a1 - a0
-                    da = (da + math.pi) % (2 * math.pi) - math.pi
-                    if math.copysign(1.0, da) != math.copysign(1.0, turn):
-                        da += 2 * math.pi * math.copysign(1.0, turn)
-                    if abs(math.degrees(da)) >= ARC_MIN_SPAN * 0.5:
-                        samples = [np.array([cx + R * math.cos(a0 + s_), cy + R * math.sin(a0 + s_)])
-                                   for s_ in np.linspace(0.0, da, ARC_SAMPLES)[1:-1]]
-                        out.append(np.array(j1))
-                        out.extend(samples)
-                        out.append(np.array(j2))
-                        is_arc = True
+        if should_fillet:
+            sel = raw[tree.query_ball_point(v, r=PATCH_NEAR)]
+            if len(sel) >= 8:
+                cx, cy, R, res = fit_circle_trimmed(sel)
+                if ARC_R_MIN <= R <= ARC_R_MAX and res <= ARC_RESIDUAL_MAX:
+                    j1 = _line_circle_pt_along(v, -d1, (cx, cy, R), v)
+                    j2 = _line_circle_pt_along(v, d2, (cx, cy, R), v)
+                    t1 = float(np.linalg.norm(j1 - v))
+                    t2 = float(np.linalg.norm(j2 - v))
+                    if 0.5 <= t1 <= l1 and 0.5 <= t2 <= l2:     # 切点须落在两邻边内
+                        a0 = math.atan2(j1[1] - cy, j1[0] - cx)
+                        a1 = math.atan2(j2[1] - cy, j2[0] - cx)
+                        da = a1 - a0
+                        da = (da + math.pi) % (2 * math.pi) - math.pi   # 短弧
+                        if ARC_MIN_SPAN <= abs(math.degrees(da)) <= 170.0:
+                            samples = [np.array([cx + R * math.cos(a0 + s_), cy + R * math.sin(a0 + s_)])
+                                       for s_ in np.linspace(0.0, da, ARC_SAMPLES)[1:-1]]
+                            out.append(np.array(j1))
+                            out.extend(samples)
+                            out.append(np.array(j2))
+                            is_arc = True
         if not is_arc:
-            out.append(v)                                  # 非弧：原样保留角(含可能的小斜线靠弦)
+            out.append(v)                                  # 非弧：原样保留角
     out = np.array(out)
     return out if len(out) >= 4 else base
 
@@ -293,9 +302,7 @@ def _line_circle_pt_along(p, d, circle, near):
     A = float(d @ d)
     B = 2.0 * float(d @ pc)
     C = float(pc @ pc) - R * R
-    disc = B * B - 4 * A * C
-    if disc < 0:
-        return None
+    disc = max(B * B - 4 * A * C, 0.0)   # 相切时浮点误差可为负，截断为0取切点
     sq = math.sqrt(disc)
     cands = [p + t_ * d for t_ in [(-B + sq) / (2 * A), (-B - sq) / (2 * A)]]
     return min(cands, key=lambda q: float(np.linalg.norm(q - near)))
@@ -339,7 +346,7 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
     except Exception:
         base = back
     base = remove_collinear_points(base)
-    # 2) 补丁：把楼梯段识别成 圆弧/小斜线（失败则原样保留基底）
+    # 2) 补丁：用"融合边界"(纯轮廓、无内部柱污染)拟合圆弧/小斜线并替换对应角（失败则原样保留基底）
     try:
         base = enhance_arcs_slants(base, frame)
     except Exception:
