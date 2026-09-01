@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, MultiPoint
+from scipy.ndimage import uniform_filter1d
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -36,6 +37,20 @@ BRIDGE_DIST = 1.5    # 搭桥缝合距离
 FLATTEN_TOL = 5.0    # 一维聚类拉平容差(线必须水平/竖直)(调大并干净台阶)
 MORPH = 0.0          # 形态学滤毛刺半径(用户版 buffer(-r).buffer(r))；红点是细墙环，设0避免被削没
 ORIENT_THRESH = 8.0  # 主方向角度阈值(°)：小 => 世界系水平/竖直；大 => 主方向系正交(斜着但线线90°)
+
+# v0.22 分段拟合参数（保留斜线+圆弧）
+TURN_EPS = 2.0       # 直段判据：平滑后转弯率|度| ≤ 此值
+CORNER_EPS = 25.0    # 转角判据：原始转弯率|度| > 此值
+SMOOTH_W = 9         # 转弯率平滑窗宽
+SLANT_TOL = 2.0      # 斜线阈：偏离轴线(度)>=此值且长度>=SLANT_MIN_LEN 保留为斜线
+SLANT_MIN_LEN = 2.0  # 斜线最短长度(m)
+ARC_R_MIN = 5.0      # 圆弧半径下限(m)
+ARC_R_MAX = 200.0    # 圆弧半径上限(m)
+ARC_MIN_SPAN = 25.0  # 圆弧最小跨度(度)
+ARC_RESIDUAL_MAX = 0.8  # 圆弧拟合最大残差(m)
+ARC_SAMPLES = 24     # 圆弧采样点数
+STAIR_LEN = 4.0      # 基底"台阶段"判定：短边长度阈值(m)
+PATCH_NEAR = 2.5     # 补丁拟合时取原始边界附近点的半径(m)
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
 SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
@@ -112,10 +127,184 @@ def orthogonalize(poly, tol=ORTHO_TOL):
     return newpoly
 
 
+def _turns(coords):
+    """每顶点转弯角(度, 环形平滑)。"""
+    n = len(coords)
+    e = coords - np.roll(coords, 1, axis=0)
+    ang = np.arctan2(e[:, 1], e[:, 0])
+    t = np.diff(np.append(ang, ang[:1]))
+    return uniform_filter1d(np.degrees(t), size=SMOOTH_W, mode="wrap")
+
+
+def segmentize(coords):
+    """按转弯率把环形边界分成 (start,length,label) 各段；label 1=圆/斜段, 0=直段。
+    转角顶点(|t|>CORNER_EPS)作为段与段的分界，不归属任何段。"""
+    n = len(coords)
+    t = _turns(coords)
+    raw_t = t * 1.0  # 平滑后
+    corner = np.abs(raw_t) > CORNER_EPS
+    if corner.sum() == 0:
+        lab = 1 if np.mean(np.abs(raw_t)) > TURN_EPS else 0
+        return [(0, n, lab)]
+    runs = []
+    ci = np.flatnonzero(corner)
+    for k in range(len(ci)):
+        a = ci[k]
+        b = ci[(k + 1) % len(ci)]
+        length = (b - a - 1) % n
+        if length < 3:                      # 过短段并入相邻，不入特征
+            continue
+        start = (a + 1) % n
+        idx = (start + np.arange(length)) % n
+        avg = np.mean(np.abs(raw_t[idx]))
+        runs.append((start, length, 1 if avg > TURN_EPS else 0))
+    return runs
+
+
+def fit_line(pts):
+    """最小二乘直线：返回 (点p0, 单位方向d)。"""
+    c = pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts - c)
+    d = vt[0]
+    return c, d / np.linalg.norm(d)
+
+
+def _line_orient(d):
+    ang = math.degrees(math.atan2(d[1], d[0])) % 180.0
+    dev = min(ang % 90.0, 90.0 - ang % 90.0)
+    axis = 0 if (ang % 90.0) < 45.0 else 1   # 0=水平,1=竖直
+    return ang, dev, axis
+
+
+def fit_circle(pts):
+    """Kasa 圆拟合，返回 (cx, cy, R, maxresid)。"""
+    A = np.column_stack([2 * pts[:, 0], 2 * pts[:, 1], np.ones(len(pts))])
+    b = pts[:, 0] ** 2 + pts[:, 1] ** 2
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, k = sol
+    R = np.sqrt(k + cx * cx + cy * cy)
+    resid = np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - R)
+    return cx, cy, R, float(resid.max())
+
+
+def _corner_point(f1, f2, near):
+    """相邻两特征求交点；失败返回 None。"""
+    if f1[0] == "line" and f2[0] == "line":
+        p1, d1 = f1[1][:2]
+        p2, d2 = f2[1][:2]
+        den = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(den) < 1e-9:
+            return None
+        t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den
+        return p1 + t * d1
+    # 线-圆 / 圆-线 / 圆-圆统一用"找特征2上离near最近且满足特征1"的近似：
+    # 简化：用特征1与特征2在 near 附近各自投影的最小间距点——直接用 near 的投影
+    if f1[0] == "line" and f2[0] == "arc":
+        p, d = f1[1][:2]
+        cx, cy, R = f2[1][:3]
+        return _line_circle_pt(p, d, (cx, cy, R), near)
+    if f1[0] == "arc" and f2[0] == "line":
+        p, d = f2[1][:2]
+        cx, cy, R = f1[1][:3]
+        return _line_circle_pt(p, d, (cx, cy, R), near)
+    return near                                # 圆-圆等罕见情况：直接用分界点
+
+
+def _line_circle_pt(p, d, circle, near):
+    cx, cy, R = circle
+    pc = p - np.array([cx, cy])
+    A = float(d @ d)
+    B = 2.0 * float(d @ pc)
+    C = float(pc @ pc) - R * R
+    disc = B * B - 4 * A * C
+    if disc < 0:
+        return None
+    sq = math.sqrt(disc)
+    cands = [p + t_ * d for t_ in [(-B + sq) / (2 * A), (-B - sq) / (2 * A)]]
+    return min(cands, key=lambda q: float(np.linalg.norm(q - near)))
+
+
+def _smooth_ring(coords, iters=3, size=5):
+    """绕环均匀滤波，抹掉 buffer 边界锯齿，让转弯率局部化。"""
+    c = np.asarray(coords, dtype=np.float64)
+    for _ in range(iters):
+        c = np.column_stack([uniform_filter1d(c[:, 0], size=size, mode="wrap"),
+                             uniform_filter1d(c[:, 1], size=size, mode="wrap")])
+    return c
+
+
+def enhance_arcs_slants(base, raw, min_corner=40.0, max_corner=140.0):
+    """角上圆角(fillet)：遍历基底每个角，若角附近原始墙边能拟合出真实圆弧(R∈[5,200]、残差小、跨度足够)，
+    则将角替换为"两切点之间"的圆弧采样；否则角度若为斜线(弦偏离轴线≥SLANT_TOL且长≥SLANT_MIN_LEN)则保留弦。
+    失败/无特征则原样保留。raw: 融合边界(活动坐标系)。"""
+    n = len(base)
+    if n < 6:
+        return base
+    from scipy.spatial import cKDTree
+    tree = cKDTree(raw)
+    out = []
+    for i in range(n):
+        v_prev, v, v_next = base[i - 1], base[i], base[(i + 1) % n]
+        e1 = v - v_prev
+        e2 = v_next - v
+        l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+        if l1 < 1e-9 or l2 < 1e-9:
+            out.append(v)
+            continue
+        d1, d2 = e1 / l1, e2 / l2
+        turn = math.degrees(math.atan2(d2[1], d2[0]) - math.atan2(d1[1], d1[0]))
+        turn = (turn + 180.0) % 360.0 - 180.0
+        if abs(turn) < min_corner or abs(turn) > max_corner:
+            out.append(v)
+            continue
+        sel = raw[tree.query_ball_point(v, r=PATCH_NEAR)]
+        is_arc = False
+        if len(sel) >= 8:
+            cx, cy, R, res = fit_circle(sel)
+            if ARC_R_MIN <= R <= ARC_R_MAX and res <= ARC_RESIDUAL_MAX:
+                j1 = _line_circle_pt_along(v, -d1, (cx, cy, R), v)   # 前一边方向(后退)
+                j2 = _line_circle_pt_along(v, d2, (cx, cy, R), v)    # 后一边方向(前进)
+                if j1 is not None and j2 is not None \
+                        and float(np.linalg.norm(j1 - v_prev)) <= l1 + 1.5 \
+                        and float(np.linalg.norm(j2 - v_next)) <= l2 + 1.5:
+                    a0 = math.atan2(j1[1] - cy, j1[0] - cx)
+                    a1 = math.atan2(j2[1] - cy, j2[0] - cx)
+                    da = a1 - a0
+                    da = (da + math.pi) % (2 * math.pi) - math.pi
+                    if math.copysign(1.0, da) != math.copysign(1.0, turn):
+                        da += 2 * math.pi * math.copysign(1.0, turn)
+                    if abs(math.degrees(da)) >= ARC_MIN_SPAN * 0.5:
+                        samples = [np.array([cx + R * math.cos(a0 + s_), cy + R * math.sin(a0 + s_)])
+                                   for s_ in np.linspace(0.0, da, ARC_SAMPLES)[1:-1]]
+                        out.append(np.array(j1))
+                        out.extend(samples)
+                        out.append(np.array(j2))
+                        is_arc = True
+        if not is_arc:
+            out.append(v)                                  # 非弧：原样保留角(含可能的小斜线靠弦)
+    out = np.array(out)
+    return out if len(out) >= 4 else base
+
+
+def _line_circle_pt_along(p, d, circle, near):
+    """过 p 沿方向 d 的直线与圆(circle)的最近交点(near 附近)。"""
+    cx, cy, R = circle
+    pc = p - np.array([cx, cy])
+    A = float(d @ d)
+    B = 2.0 * float(d @ pc)
+    C = float(pc @ pc) - R * R
+    disc = B * B - 4 * A * C
+    if disc < 0:
+        return None
+    sq = math.sqrt(disc)
+    cands = [p + t_ * d for t_ in [(-B + sq) / (2 * A), (-B - sq) / (2 * A)]]
+    return min(cands, key=lambda q: float(np.linalg.norm(q - near)))
+
+
 def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
                        flatten_tol=FLATTEN_TOL, morph=MORPH):
-    """用户版连线规则：网格->buffer融合->搭桥->形态学滤毛刺->snap_1d拉平->去共线。
-    返回 最终坐标（线为水平/竖直）。pts 为 (N,2) 红点。"""
+    """用户版连线规则：网格->buffer融合->搭桥->形态学滤毛刺(可选)。
+    接着 分段识别+拟合+重建：直线(含水平/竖直/小斜线) + 圆弧；失败回退 snap_1d 正交版。"""
     if len(pts) < 3:
         raise ValueError("红点过少")
     grid_coords = np.floor(pts / grid_size).astype(np.int32)
@@ -128,7 +317,7 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
     if hasattr(fused, "geoms"):
         fused = max(fused.geoms, key=lambda p: p.area)
     raw_coords = np.array(fused.exterior.coords)[:-1]
-    # 自动抉择：主方向角度小(轴对齐) => 世界系水平/竖直；角度大(整体倾斜) => 主方向系正交(线线90°)
+    # 自动抉择：主方向角度小(轴对齐) => 世界系；角度大(整体倾斜) => 主方向系
     rc = np.asarray(fused.minimum_rotated_rectangle.exterior.coords)
     d = rc[1] - rc[0]
     ang = math.atan2(d[1], d[0]) % (math.pi / 2)
@@ -136,24 +325,27 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
         ang -= math.pi / 2
     c = raw_coords.mean(axis=0)
     if abs(ang) <= math.radians(ORIENT_THRESH):
-        ang = 0.0                                       # 轴对齐建筑：世界系水平/竖直
-    if ang == 0.0:
-        sx = snap_1d_coordinates(raw_coords[:, 0], tol=flatten_tol)
-        sy = snap_1d_coordinates(raw_coords[:, 1], tol=flatten_tol)
-        back = np.column_stack([sx, sy])
-    else:
-        rot = _rotate(raw_coords, -ang, c)              # 转到主方向(墙对齐轴)
-        sx = snap_1d_coordinates(rot[:, 0], tol=flatten_tol)
-        sy = snap_1d_coordinates(rot[:, 1], tol=flatten_tol)
-        back = _rotate(np.column_stack([sx, sy]), ang, c)  # 转回：斜着但线线正交
+        ang = 0.0
+    frame = raw_coords if ang == 0.0 else _rotate(raw_coords, -ang, c)
+    # 1) 基底：v0.21 snap_1d 正交拉平（稳定）
+    sx = snap_1d_coordinates(frame[:, 0], tol=flatten_tol)
+    sy = snap_1d_coordinates(frame[:, 1], tol=flatten_tol)
+    back = np.column_stack([sx, sy])
     try:
-        clean_poly = Polygon(np.vstack([back, back[:1]])).buffer(0)
-        if clean_poly.geom_type == "MultiPolygon":
-            clean_poly = max(clean_poly.geoms, key=lambda p: p.area)
-        final = np.array(clean_poly.exterior.coords)
+        cp = Polygon(np.vstack([back, back[:1]])).buffer(0)
+        if cp.geom_type == "MultiPolygon":
+            cp = max(cp.geoms, key=lambda p: p.area)
+        base = np.array(cp.exterior.coords)[:-1]
     except Exception:
-        final = np.vstack([back, back[:1]])
-    return remove_collinear_points(final)
+        base = back
+    base = remove_collinear_points(base)
+    # 2) 补丁：把楼梯段识别成 圆弧/小斜线（失败则原样保留基底）
+    try:
+        base = enhance_arcs_slants(base, frame)
+    except Exception:
+        pass
+    back = base if ang == 0.0 else _rotate(base, ang, c)
+    return back
 
 
 def read_wall_xy(ply_path):
