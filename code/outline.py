@@ -16,18 +16,25 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPoint
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 import open3d as o3d
 import contour as contour_mod       # 复用 trace_outline（栅格+闭运算+填孔+外沿轮廓）
+import outer as outer_mod           # 复用 read_xyz / classify（获得红点=外墙高密度点）
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+# 用户版"连线规则"参数
+GRID_SIZE = 0.3      # 网格
+BRIDGE_DIST = 1.5    # 搭桥缝合距离
+FLATTEN_TOL = 3.0    # 一维聚类拉平容差(线必须水平/竖直)
+MORPH = 0.0          # 形态学滤毛刺半径(用户版 buffer(-r).buffer(r))；红点是细墙环，设0避免被削没
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
 SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
@@ -104,6 +111,35 @@ def orthogonalize(poly, tol=ORTHO_TOL):
     return newpoly
 
 
+def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
+                       flatten_tol=FLATTEN_TOL, morph=MORPH):
+    """用户版连线规则：网格->buffer融合->搭桥->形态学滤毛刺->snap_1d拉平->去共线。
+    返回 最终坐标（线为水平/竖直）。pts 为 (N,2) 红点。"""
+    if len(pts) < 3:
+        raise ValueError("红点过少")
+    grid_coords = np.floor(pts / grid_size).astype(np.int32)
+    unique_cells = np.unique(grid_coords, axis=0)
+    centers = unique_cells * grid_size + grid_size / 2.0
+    base = MultiPoint(centers).buffer(grid_size / 2.0 * 1.05, cap_style=3)
+    fused = base.buffer(bridge_dist, join_style=2).buffer(-bridge_dist, join_style=2)
+    if morph:
+        fused = fused.buffer(-morph, join_style=2).buffer(morph, join_style=2)
+    if hasattr(fused, "geoms"):
+        fused = max(fused.geoms, key=lambda p: p.area)
+    raw_coords = np.array(fused.exterior.coords)
+    sx = snap_1d_coordinates(raw_coords[:, 0], tol=flatten_tol)
+    sy = snap_1d_coordinates(raw_coords[:, 1], tol=flatten_tol)
+    snapped = np.column_stack([sx, sy])
+    try:
+        clean_poly = Polygon(snapped).buffer(0)
+        if clean_poly.geom_type == "MultiPolygon":
+            clean_poly = max(clean_poly.geoms, key=lambda p: p.area)
+        final = np.array(clean_poly.exterior.coords)
+    except Exception:
+        final = snapped
+    return remove_collinear_points(final)
+
+
 def read_wall_xy(ply_path):
     pcd = o3d.io.read_point_cloud(ply_path)
     pts = np.asarray(pcd.points, dtype=np.float64)
@@ -128,13 +164,13 @@ def plot(wall_xy, coords, path, title):
 
 
 def process(base, wall_ply, out_dir):
-    print("\n========== 正交轮廓: %s ==========" % wall_ply)
-    wall_xy = read_wall_xy(wall_ply)
-    base_poly = contour_mod.trace_outline(wall_xy)     # 连线成闭合轮廓
-    if SIMPLIFY_TOL > 0:
-        base_poly = base_poly.simplify(SIMPLIFY_TOL, preserve_topology=True)  # 先并直段
-    poly = orthogonalize(base_poly)                    # 主方向坐标内 snap_1d -> 直角
-    coords = remove_collinear_points(np.asarray(poly.exterior.coords))
+    print("\n========== 正交轮廓(用户连线规则): %s ==========" % wall_ply)
+    wall_xy = read_wall_xy(wall_ply)                   # 连续可闭合的墙点作为连线输入
+    if len(wall_xy) < 3:
+        print("墙点过少，跳过")
+        return
+    coords = orthogonal_connect(wall_xy)               # 用户版连线规则(线必须水平/竖直)
+    poly = Polygon(coords)
     info = {
         "file": wall_ply,
         "vertices": int(len(coords) - 1),
