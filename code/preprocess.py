@@ -18,7 +18,7 @@ import sys
 import json
 import struct
 import numpy as np
-from scipy.ndimage import convolve, label
+from scipy.ndimage import convolve, label, binary_closing
 
 import matplotlib
 matplotlib.use("Agg")
@@ -37,12 +37,13 @@ try:
 except Exception:
     pass
 
-VOXEL = 0.5        # 降采样体素边长(m)
+VOXEL = 0.1        # 输出/几何降采样体素边长(m)：0.1m 提高精度
+CONN_VOXEL = 0.5   # 结构连通体素(m)：用于去噪/保留最大聚合体(0.5m 已验证对两文件都能保住完整楼体)
 MIN_NEIGHBORS = 3  # 去噪：26-邻域占用数低于此阈值判为孤立点
 NORM_RADIUS = 1.2  # 法向估计邻域半径(m)
 NORM_MAXNN = 30
 HORIZ_TOL = 0.85   # |normal.z| > 此值判为水平面(地面/天花板)，剔除
-DENSITY_GRID = 0.3 # 热力密度图栅格边长(m)
+DENSITY_GRID = 0.1 # 热力密度图栅格边长(m)
 
 
 def read_las_header(path):
@@ -155,15 +156,22 @@ def load_raw_full(path):
     raise ValueError("不支持的文件类型: %s" % ext)
 
 
-def denoise_and_largest(cells, min_neighbors=MIN_NEIGHBORS):
+def denoise_and_largest(cells, min_neighbors=MIN_NEIGHBORS, voxel=VOXEL):
     """在体素占用网格上：去孤立噪点 + 只保留最大连通聚合体。
-    返回 (keep_mask(按 cells 顺序的bool), grid 坐标偏移 shift)。"""
+    返回 (keep_mask(按 cells 顺序的bool), grid 坐标偏移 shift)。
+    voxel: 该 cells 对应的体素边长，决定是否闭运算桥接。"""
     mn = cells.min(axis=0) - 1
     shift = -mn  # 每个方向 +2 padding
     idx = cells + shift
     nx, ny, nz = idx.max(axis=0) + 1
     grid = np.zeros((nx, ny, nz), dtype=bool)
     grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+
+    # 若体素比点间距还细，先闭运算桥接小间隙，避免栅格点不连续
+    close_iter = 2 if voxel <= 0.2 else 0
+    if close_iter:
+        grid = binary_closing(grid, structure=np.ones((3, 3, 3), dtype=bool),
+                              iterations=close_iter)
 
     # 1) 去噪：统计 26-邻域占用数，过低视为孤立噪点
     kern = np.ones((3, 3, 3), dtype=np.uint8)
@@ -250,9 +258,10 @@ def plot_perspective(xyz, path, title):
     plt.close(fig)
 
 
-def density_heatmap(raw_xyz, wall_cells, shift, voxel, grid, path, title):
+def density_heatmap(raw_xyz, wall_cells, shift_ignored, voxel, grid, path, title):
     """用原始分辨率点统计墙体结构的密度，栅格化到 grid×grid(m) 并渲染热力图。
-    raw_xyz: 原始点 (N,3); wall_cells: 墙体 0.5m 体素键 (M,3); shift: 体素网格偏移。"""
+    raw_xyz: 原始点 (N,3); wall_cells: 墙体体素键 (M,3); shift_ignored: 兼容旧签名。"""
+    shift = -wall_cells.min(axis=0) + 1   # 由 wall_cells 自行求得网格偏移
     idx = wall_cells + shift
     shape = idx.max(axis=0) + 1
     wgrid = np.zeros(shape, dtype=bool)
@@ -295,9 +304,9 @@ def process(name, path, out_dir):
     base = name
     print("\n========== 处理: %s ==========" % path)
 
-    # 1) 读取 + 0.5m 体素降采样
+    # 1) 读取 + 细体素降采样(0.1m，用于几何/输出)
     xyz, cells = load_source(path)
-    print("0.5m 体素降采样后代表点数=%d" % len(cells))
+    print("%.1fm 体素降采样后代表点数=%d" % (VOXEL, len(cells)))
     if len(cells) == 0:
         print("无数据，跳过")
         return
@@ -306,8 +315,9 @@ def process(name, path, out_dir):
     plot_topview(xyz[:, :2], "%s/%s_俯视_原始.png" % (out_dir, base),
                  "%s 降采样后原始点云(按Z着色)" % base, color=xyz[:, 2], cbar_label="Z (m)")
 
-    # 2) 去噪 + 最大聚合体
-    keep_mask, shift = denoise_and_largest(cells)
+    # 2) 结构连通(粗格)去噪 + 最大聚合体：用 CONN_VOXEL(≥点间距)确保楼体连线完整
+    cellsC = np.floor(xyz / CONN_VOXEL).astype(np.int64)
+    keep_mask, shift = denoise_and_largest(cellsC, voxel=CONN_VOXEL)
     comp_cells = cells[keep_mask]
     comp_xyz = xyz[keep_mask]
     print("去噪+保留最大连通聚合体后代表点=%d (剔除孤立/小簇 %d)" %

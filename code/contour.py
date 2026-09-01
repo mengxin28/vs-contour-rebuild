@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-RASTER_GRID = 0.5   # 栅格边长(m)，越小越精细
+RASTER_GRID = 0.5   # 轮廓栅格(m)：受外墙连续性限制，0.5m 最稳无断口(小于外墙连续缝会碎)
 CLOSE_ITER = 2      # 闭运算次数：把外墙缝连起来（0=不连缝）
 OPEN_KERNEL = 2     # 开运算核边长：去掉一格外伸的细刺(0=不去刺)
 SIMPLIFY_TOL = 0.8  # 贴合轮廓线简化容差(m)

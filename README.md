@@ -32,8 +32,9 @@ python code/contour.py 输出/CLEAN_UNDER_GROUND_wall.ply 输出/RESULT_B1_wall.
 python code/outer.py CLEAN_UNDER_GROUND.ply RESULT_B1.ply
 ```
 
-默认参数：降采样 `0.5m`、密度栅格 `0.3m`（见 `code/preprocess.py` 顶部常量
-`VOXEL`、`MIN_NEIGHBORS`、`NORM_RADIUS`、`HORIZ_TOL`、`DENSITY_GRID`）。
+默认参数：输出/几何降采样 `0.1m`（`VOXEL`），结构连通用 `0.5m`（`CONN_VOXEL`），密度栅格 `0.3m`
+（见 `code/preprocess.py` 顶部常量 `VOXEL`、`CONN_VOXEL`、`MIN_NEIGHBORS`、`NORM_RADIUS`、`HORIZ_TOL`、`DENSITY_GRID`）。
+> 说明：0.1m 让基础点云更精；但轮廓栅格受**外墙连续性**限制，`contour.RASTER_GRID` 用 0.5m 最稳。
 贴合轮廓线用 `RASTER_GRID`、`CLOSE_ITER`、`OPEN_KERNEL`、`SIMPLIFY_TOL`；
 规则化（转正+Douglas-Peucker）用 `REG_TOL`（见 `code/contour.py` 顶部）。
 
