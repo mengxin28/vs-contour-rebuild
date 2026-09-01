@@ -30,6 +30,7 @@ except Exception:
     pass
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
+SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
 
 
 def snap_1d_coordinates(values, tol=ORTHO_TOL):
@@ -130,6 +131,8 @@ def process(base, wall_ply, out_dir):
     print("\n========== 正交轮廓: %s ==========" % wall_ply)
     wall_xy = read_wall_xy(wall_ply)
     base_poly = contour_mod.trace_outline(wall_xy)     # 连线成闭合轮廓
+    if SIMPLIFY_TOL > 0:
+        base_poly = base_poly.simplify(SIMPLIFY_TOL, preserve_topology=True)  # 先并直段
     poly = orthogonalize(base_poly)                    # 主方向坐标内 snap_1d -> 直角
     coords = remove_collinear_points(np.asarray(poly.exterior.coords))
     info = {
