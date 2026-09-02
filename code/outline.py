@@ -436,17 +436,8 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
     except Exception:
         base = back
     base = remove_collinear_points(base)
-    # 2) 补丁：斜线检补（斜交墙面保留为直线；失败/无效则原样保留正交基底）
+    # 2) 正交前提：轮廓线必须全部水平/竖直（斜线增强已停用 enrich_slants 未调用）
     cp_base_area = float(Polygon(np.vstack([base, base[:1]])).area)
-    try:
-        enhanced = enhance_slants(base, frame)
-        p_enh = Polygon(np.vstack([enhanced, enhanced[:1]]))
-        if not p_enh.is_valid:
-            p_enh = p_enh.buffer(0)
-        if p_enh.geom_type == "Polygon" and 0.6 * cp_base_area <= p_enh.area <= 1.4 * cp_base_area:
-            base = enhanced
-    except Exception:
-        pass
     # 3) 外皮贴墙：用"真实墙点"把每段线平移到墙带最外侧(墙外皮)，相邻段求交。
     #    校验：面积接近(0.85~1.3×) 且 贴墙偏差中位≤0.5m(线落在墙带上)；小自交由 buffer(0) 修复。
     try:
@@ -461,7 +452,7 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
             from scipy.spatial import cKDTree as _T
             coords = np.array(p_h.exterior.coords)[:-1]
             dh, _ = _T(pts_frame).query(coords, k=1)
-            if float(np.median(dh)) <= 0.5:            # 线确实落在墙带上
+            if float(np.median(dh)) <= 0.6:            # 线确实落在墙带上
                 base = remove_collinear_points(coords)
     except Exception:
         pass
