@@ -284,6 +284,56 @@ def enhance_slants(base, raw_b, min_edge_len=5.0):
     return out if len(out) >= 4 else base
 
 
+def hug_outer_edge(base, raw_b, corridor=1.5):
+    """外皮贴墙：把底图每段线沿其"外法向"平移到真实墙点带的最外侧(外皮)。
+    CCW 环（shapely exterior 方向）：行进方向右侧=外侧。相邻段求交得贴墙多边形。"""
+    n = len(base)
+    if n < 4:
+        return base
+    area = 0.5 * float(np.sum(base[:, 0] * np.roll(base[:, 1], -1) - np.roll(base[:, 0], -1) * base[:, 1]))
+    ring = base.copy()
+    if area < 0:
+        ring = ring[::-1]
+    segs = []
+    for i in range(n):
+        a, b = ring[i], ring[(i + 1) % n]
+        e = b - a
+        L = float(np.linalg.norm(e))
+        if L < 1e-9:
+            continue
+        d = e / L
+        nout = np.array([d[1], -d[0]])                 # CCW: 右侧=外侧
+        v = raw_b - a
+        t = v @ d
+        s = v @ nout
+        m = (np.abs(s) <= corridor + 1.0) & (t >= -1.0) & (t <= L + 1.0)
+        off = 0.0
+        if int(m.sum()) >= 10:
+            band_c = float(np.median(s[m]))            # 墙带中心(离当前线最近的墙带)
+            band = s[m][(np.abs(s[m] - band_c) <= 1.2)]  # 取该墙带内的点
+            if len(band) >= 5:
+                off = float(np.percentile(band, 98.0))  # 该墙带的最外侧=外皮
+        off = float(np.clip(off, -1.5, 1.5))            # 限幅防跳变
+        segs.append((d, a + off * nout))
+    m = len(segs)
+    corners = []
+    for j in range(m):
+        d1, p1 = segs[j]
+        d2, p2 = segs[(j + 1) % m]
+        anchor = ring[(j + 1) % n]                    # 该交点对应的原顶点
+        den = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(den) < 1e-6:
+            corners.append(p1)                        # 平行相邻：保留
+            continue
+        tt = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den
+        P = p1 + tt * d1
+        if float(np.linalg.norm(P - anchor)) > 4.0:   # 交点跑远(细尖刺防护) -> 用原顶点
+            P = anchor
+        corners.append(P)
+    out = np.array(corners)
+    return out if len(out) >= 4 else base
+
+
 def enhance_arcs_slants(base, raw, min_corner=40.0, max_corner=140.0):
     """[已停用-暂不主攻圆弧] 角上圆角(fillet)：遍历基底每个角，若角附近原始墙边能拟合出真实圆弧(R∈[5,200]、残差小、跨度足够)，
     则将角替换为"两切点之间"的圆弧采样；否则角度若为斜线(弦偏离轴线≥SLANT_TOL且长≥SLANT_MIN_LEN)则保留弦。
@@ -395,6 +445,24 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
             p_enh = p_enh.buffer(0)
         if p_enh.geom_type == "Polygon" and 0.6 * cp_base_area <= p_enh.area <= 1.4 * cp_base_area:
             base = enhanced
+    except Exception:
+        pass
+    # 3) 外皮贴墙：用"真实墙点"把每段线平移到墙带最外侧(墙外皮)，相邻段求交。
+    #    校验：面积接近(0.85~1.3×) 且 贴墙偏差中位≤0.5m(线落在墙带上)；小自交由 buffer(0) 修复。
+    try:
+        pts_frame = pts if ang == 0.0 else _rotate(pts, -ang, c)
+        hugged = hug_outer_edge(base, pts_frame)
+        p_h = Polygon(np.vstack([hugged, hugged[:1]]))
+        if not p_h.is_valid:
+            p_h = p_h.buffer(0)
+        if p_h.geom_type == "MultiPolygon":
+            p_h = max(p_h.geoms, key=lambda gp: gp.area)
+        if p_h.geom_type == "Polygon" and 0.85 * cp_base_area <= p_h.area <= 1.3 * cp_base_area:
+            from scipy.spatial import cKDTree as _T
+            coords = np.array(p_h.exterior.coords)[:-1]
+            dh, _ = _T(pts_frame).query(coords, k=1)
+            if float(np.median(dh)) <= 0.5:            # 线确实落在墙带上
+                base = remove_collinear_points(coords)
     except Exception:
         pass
     back = base if ang == 0.0 else _rotate(base, ang, c)
