@@ -334,6 +334,110 @@ def hug_outer_edge(base, raw_b, corridor=1.5):
     return out if len(out) >= 4 else base
 
 
+def refine_to_wall(base, raw_wall, bin_len=5.0, clip=1.5, band=1.2, corridor=2.5):
+    """按验证反馈的高密度带，逐样本把轮廓线沿"外法向"平移到该处真实墙带的外皮位置。
+    保持水平/竖直(每样本只沿垂直方向移动) + 裁剪±clip + 就近墙带；返回贴墙H/V点列。"""
+    n = len(base)
+    if n < 4:
+        return base
+    # 定向为 CCW（右侧=外侧）
+    area = 0.5 * float(np.sum(base[:, 0] * np.roll(base[:, 1], -1) - np.roll(base[:, 0], -1) * base[:, 1]))
+    ring = base.copy()
+    if area < 0:
+        ring = ring[::-1]
+    # 按 0.25m 采样 + 切线方向
+    closed = np.vstack([ring, ring[:1]])
+    seg = np.diff(closed, axis=0)
+    seglen = np.linalg.norm(seg, axis=1)
+    samples, tangents = [], []
+    for i in range(len(seg)):
+        L = seglen[i]
+        ns = max(int(L / 0.25), 1)
+        for k in range(ns):
+            samples.append(closed[i] + seg[i] * (k / ns))
+            tangents.append(seg[i] / max(L, 1e-9))
+    samples = np.array(samples)
+    tangents = np.array(tangents)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(raw_wall)
+    out = samples.copy()
+    for i in range(len(samples)):
+        tk = tangents[i]
+        nout = np.array([tk[1], -tk[0]])           # 右侧=外侧(CCW)
+        sel = raw_wall[tree.query_ball_point(samples[i], r=corridor)]
+        if len(sel) < 5:
+            continue
+        s = (sel - samples[i]) @ nout
+        band_c = float(np.median(s))
+        bpts = s[np.abs(s - band_c) <= band]
+        if len(bpts) < 3:
+            continue
+        off = float(np.clip(np.percentile(bpts, 98.0), -clip, clip))
+        out[i] = samples[i] + off * nout
+    out = np.vstack([out, out[:1]])
+    # 去共线 + 保证闭合有效
+    out2 = remove_collinear_points(out[:-1])
+    poly = Polygon(np.vstack([out2, out2[:1]]))
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.geom_type != "Polygon":
+        return base
+    return np.array(poly.exterior.coords)[:-1]
+
+
+def bump_notch_local(base, far_pts, max_move=10.0):
+    """远点组局部 H/V 台阶修正：对每根边收集其"远点"(红点距轮廓>2.5m),
+    把该边上被覆盖的沿边范围 [a0,a1] 平移到远点的最外皮位置 lat_new(max(lat)),
+    插入 4 个台阶点 a/a0/a0s/a1s/a1 保证全程水平/竖直。
+    凸出墙 -> 外移; 被越过的低墙 -> 内收。返回修正点列(封闭性由调用方校验)。"""
+    n = len(base)
+    if n < 4 or len(far_pts) == 0:
+        return base
+    closed = np.vstack([base, base[:1]])
+    seg = np.diff(closed, axis=0)
+    seglen = np.linalg.norm(seg, axis=1)
+    samples, vids = [], []
+    for i in range(len(seg)):
+        L = seglen[i]
+        ns = max(int(L / 0.4), 1)
+        for k in range(ns):
+            samples.append(closed[i] + seg[i] * (k / ns))
+            vids.append(i)
+    samples = np.array(samples)
+    vids = np.array(vids)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(samples)
+    per_edge = {}
+    for p in far_pts:
+        _d, si = tree.query(p, k=1)
+        per_edge.setdefault(int(vids[si]), []).append(p)
+    out = []
+    for i in range(n):
+        a, b = base[i], base[(i + 1) % n]
+        L = float(np.linalg.norm(b - a))
+        out.append(a)
+        arr = per_edge.get(i, [])
+        if L < 1e-9 or not arr:
+            continue
+        t = (b - a) / L
+        nout = np.array([t[1], -t[0]])            # CCW 右侧=外侧
+        pts = np.array(arr)
+        along = (pts - a) @ t
+        lat = (pts - a) @ nout
+        a0 = float(np.clip(along.min(), 0.0, L))
+        a1 = float(np.clip(along.max(), 0.0, L))
+        lat_new = float(np.clip(np.max(lat), -max_move, max_move))   # 远点最外皮
+        if abs(a1 - a0) < 0.5 or abs(lat_new) < 0.8:
+            continue                             # 太小不去动
+        out.append(a + t * a0)
+        out.append(a + t * a0 + nout * lat_new)
+        out.append(a + t * a1 + nout * lat_new)
+        out.append(a + t * a1)
+    out.append(base[-1])
+    out = np.array(out)
+    return out if len(out) >= 4 else base
+
+
 def enhance_arcs_slants(base, raw, min_corner=40.0, max_corner=140.0):
     """[已停用-暂不主攻圆弧] 角上圆角(fillet)：遍历基底每个角，若角附近原始墙边能拟合出真实圆弧(R∈[5,200]、残差小、跨度足够)，
     则将角替换为"两切点之间"的圆弧采样；否则角度若为斜线(弦偏离轴线≥SLANT_TOL且长≥SLANT_MIN_LEN)则保留弦。
@@ -399,7 +503,8 @@ def _line_circle_pt_along(p, d, circle, near):
 
 
 def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
-                       flatten_tol=FLATTEN_TOL, morph=MORPH):
+                       flatten_tol=FLATTEN_TOL, morph=MORPH, guide=None):
+    """guide: 可选"外圈点云(红点)"，用于局部补凸/拉回(用户方案A)。"""
     """用户版连线规则：网格->buffer融合->搭桥->形态学滤毛刺(可选)。
     接着 分段识别+拟合+重建：直线(含水平/竖直/小斜线) + 圆弧；失败回退 snap_1d 正交版。"""
     if len(pts) < 3:
@@ -438,24 +543,44 @@ def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
     base = remove_collinear_points(base)
     # 2) 正交前提：轮廓线必须全部水平/竖直（斜线增强已停用 enrich_slants 未调用）
     cp_base_area = float(Polygon(np.vstack([base, base[:1]])).area)
-    # 3) 外皮贴墙：用"真实墙点"把每段线平移到墙带最外侧(墙外皮)，相邻段求交。
-    #    校验：面积接近(0.85~1.3×) 且 贴墙偏差中位≤0.5m(线落在墙带上)；小自交由 buffer(0) 修复。
+    # 3) 外皮贴墙：把每段线平移到墙带最外侧(墙外皮)，相邻段求交。
+    #    引导优先用"红点(外圈点云)"(验证指标即红点->线)，无则用墙点；面积0.85~1.3×且偏差中位≤0.6m才采用。
+    from scipy.spatial import cKDTree as _T
+    pts_frame = pts if ang == 0.0 else _rotate(pts, -ang, c)
+    guide_frame = None
+    if guide is not None:
+        guide_frame = guide if ang == 0.0 else _rotate(guide, -ang, c)
+    ref_pts = guide_frame if guide_frame is not None else pts_frame
     try:
-        pts_frame = pts if ang == 0.0 else _rotate(pts, -ang, c)
-        hugged = hug_outer_edge(base, pts_frame)
+        hugged = hug_outer_edge(base, ref_pts)
         p_h = Polygon(np.vstack([hugged, hugged[:1]]))
         if not p_h.is_valid:
             p_h = p_h.buffer(0)
         if p_h.geom_type == "MultiPolygon":
             p_h = max(p_h.geoms, key=lambda gp: gp.area)
         if p_h.geom_type == "Polygon" and 0.85 * cp_base_area <= p_h.area <= 1.3 * cp_base_area:
-            from scipy.spatial import cKDTree as _T
             coords = np.array(p_h.exterior.coords)[:-1]
-            dh, _ = _T(pts_frame).query(coords, k=1)
-            if float(np.median(dh)) <= 0.6:            # 线确实落在墙带上
+            dh, _ = _T(ref_pts).query(coords, k=1)
+            if float(np.median(dh)) <= 0.6:
                 base = remove_collinear_points(coords)
     except Exception:
         pass
+    # 4) 远点组局部台阶修正(方案A 补凸/拉回)：红点距轮廓>2.5m 的组 -> H/V 台阶
+    if guide is not None:
+        try:
+            far = guide[_T(base).query(guide, k=1)[0] > 2.5]
+            if len(far) > 0 and len(far) < 5000:
+                fixed = bump_notch_local(base, far)
+                p_f = Polygon(np.vstack([fixed, fixed[:1]]))
+                if not p_f.is_valid:
+                    p_f = p_f.buffer(0)
+                if p_f.geom_type == "Polygon" and 0.85 * cp_base_area <= p_f.area <= 1.3 * cp_base_area:
+                    d_new = float(np.median(_T(guide).query(fixed, k=1)[0]))
+                    d_old = float(np.median(_T(guide).query(base, k=1)[0]))
+                    if d_new <= d_old:              # 红点偏差确实下降才采用
+                        base = remove_collinear_points(fixed)
+        except Exception:
+            pass
     back = base if ang == 0.0 else _rotate(base, ang, c)
     return back
 
@@ -489,7 +614,23 @@ def process(base, wall_ply, out_dir):
     if len(wall_xy) < 3:
         print("墙点过少，跳过")
         return
-    coords = orthogonal_connect(wall_xy)               # 用户版连线规则(线必须水平/竖直)
+    # 尝试找对应源点云算"外圈点云(红点)"，用于局部补凸/拉回
+    guide = None
+    src_found = None
+    for ext in (".ply", ".las", ".laz"):
+        cand = os.path.join(os.path.dirname(wall_ply), "..", base + ext)
+        if os.path.exists(cand):
+            src_found = cand
+            break
+    if src_found and os.path.exists(src_found):
+        try:
+            raw = outer_mod.read_xyz(src_found)
+            red, orange, _i = outer_mod.classify(raw)
+            guide = raw[red][:, :2]
+            print("引导(外圈点云红点)=%d" % len(guide))
+        except Exception:
+            guide = None
+    coords = orthogonal_connect(wall_xy, guide=guide)  # 用户版连线规则(线必须水平/竖直)
     poly = Polygon(coords)
     info = {
         "file": wall_ply,
