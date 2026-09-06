@@ -4,6 +4,9 @@
 输入：preprocess 得到的 `*_wall.ply`（投影后 Z=0 的整面墙点）。
 流程：contour.trace_outline 连成闭合轮廓 -> 在建筑主方向坐标系内 snap_1d 一维聚类拉平 -> 去共线。
       在"主方向坐标系"内正交化，因此旋转类车库(如雅德)也能得到带直角的规整矩形。
+v0.28 入口坡道并入：在原始终点云上检测"坡度走廊"(主体带之上、坡度3°~25°的坡面
+      连通域)-> 定向矩形入口 -> 与主体轮廓 union 成**一个闭合体**(原始终点含坡面点,
+      wall.ply 因剔地面已不含坡面,故必须在轮廓环节靠源点云补回)。
 输出：`*_正交轮廓.png`（灰=墙点投影，红=正交轮廓）+ `*_正交轮廓.json`。
 用法：
     python outline.py 输出/粟塘B1_wall.ply 输出/雅德B1_wall.ply
@@ -17,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, MultiPoint
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import uniform_filter1d, gaussian_filter, binary_closing, binary_fill_holes, label, distance_transform_edt
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -55,6 +58,19 @@ PATCH_NEAR = 8.0     # 补丁拟合时取原始边界附近点的半径(m)(需�
 
 ORTHO_TOL = 3.0   # 一维坐标聚类容差(m)：把落点吸附到同一直线 -> 直角
 SIMPLIFY_TOL = 6.0  # 连线后 Douglas-Peucker 简化容差(m)：先把微台阶并成直段再直角化
+
+# ------------------- v0.28 入口坡道并入（占位差集版） -------------------
+RAMP_GRID = 0.5        # 占位栅格(m)
+RAMP_MIN_COUNT = 3     # 每格最少点数(占位判定)
+RAMP_NEAR_BODY_M = 15.0  # 外侧带搜索宽度(m): 主体边沿向外 15m 内找伸出结构
+RAMP_MIN_CELLS = 20    # 连通域最少格数(0.5m 格 => 5m², 隔离微碎片矩形)
+RAMP_MIN_LEN = 5.0     # 走廊最低主轴长度(m)
+RAMP_MIN_WIDTH = 2.0   # 长廊道最低宽度(m)
+RAMP_MAX_WIDTH = 14.0  # 走廊最大宽度(m, 防整片大堂误判)
+RAMP_W_MARGIN = 0.6    # 入口矩形宽向膨胀(m, 含坡道墙厚)
+RAMP_EXTEND = 2.0      # 矩形底端向主体内延伸(m, 保证 union 无缝)
+RAMP_ASPECT_MIN = 1.4  # 走廊长/宽最小比(细长走廊才算入口)
+RAMP_AREA_MAX_FRAC = 0.30  # 入口矩形面积上限(占主体面积比例)
 
 
 def snap_1d_coordinates(values, tol=ORTHO_TOL):
@@ -502,6 +518,92 @@ def _line_circle_pt_along(p, d, circle, near):
     return min(cands, key=lambda q: float(np.linalg.norm(q - near)))
 
 
+def detect_ramp(raw, body_poly=None):
+    """v0.28 入口坡道检测（密度梯度定边 + 伸出主体定本体）。
+    核心认识(已实测): 这12个车库的坡道 z 全程压在层高带内(地坪->顶板=地表,
+    高差=层高); "z 高于主体带"判据必然截断坡道(前两版均失败)。
+    正确判据(与用户"密度梯度"一致): 坡道=**从主体轮廓外沿向外伸出的窄长
+    占位带**(点云密度从主体连续延伸出去)。实现:
+    1) 源点云 0.5m 栅格占位(≥RAMP_MIN_COUNT点/格);
+    2) 用**正交主体轮廓 body_poly**(v0.27 结果)做内/外判定: 占位格中心在
+       body_poly 外、且距 body_poly ≤ RAMP_NEAR_BODY_M -> exterior 候选;
+    3) 闭运算连缝 -> 连通域; 域校验: 格数∈[RAMP_MIN_CELLS, 3%主体]、
+       细长(长≥RAMP_MIN_LEN/宽2~14m/长宽比) -> 入口/突出结构;
+    4) 域格 PCA 主轴 -> 定向矩形(斜入口保留斜向); 底端向主体延伸
+       RAMP_EXTEND 保证与 body_poly union 无缝;
+    5) 返回 rects 供 process() union。无突出 => rects=[] 安全退化(同 v0.27)。
+    参考: CLEAN R1(顶部带)28%墙点、R3(右下)部分墙点落在 v0.27 轮廓外, 即
+    突出段存在于 wall.ply, 只因 snap_1d(FLATTEN_TOL=5m)被磨平。
+    返回 (rects[list[Polygon]], cell_list[list[(M,2)]], info[dict])。"""
+    if body_poly is None:
+        return [], [], {"status": "无主体轮廓参考"}
+    xy = raw[:, :2]
+    origin = xy.min(axis=0)
+    g = np.floor((xy - origin) / RAMP_GRID).astype(np.int64)
+    nx, ny = int(g[:, 0].max()) + 1, int(g[:, 1].max()) + 1
+    lin = g[:, 1] * nx + g[:, 0]
+    size = int(nx * ny)
+    count = np.bincount(lin, minlength=size)
+    occ2 = (count >= RAMP_MIN_COUNT).reshape(ny, nx)
+    if int(occ2.sum()) < RAMP_MIN_CELLS:
+        return [], [], {"status": "占格不足", "cells": int(occ2.sum())}
+    # 2) 以 body_poly 判定内/外; 候选 = body_poly 外 且距其 ≤近带
+    near = body_poly.buffer(RAMP_NEAR_BODY_M)
+    ys, xs = np.nonzero(occ2)
+    cell_xy = np.column_stack([origin[0] + (xs + 0.5) * RAMP_GRID,
+                               origin[1] + (ys + 0.5) * RAMP_GRID])
+    from shapely import contains_xy
+    in_band = contains_xy(near, cell_xy[:, 0], cell_xy[:, 1])
+    in_body = contains_xy(body_poly, cell_xy[:, 0], cell_xy[:, 1])
+    ext_mask = np.zeros((ny, nx), dtype=bool)
+    ext_mask[ys[in_band & ~in_body], xs[in_band & ~in_body]] = True
+    if int(ext_mask.sum()) < RAMP_MIN_CELLS:
+        return [], [], {"status": "无外侧延伸(坡道全在轮廓内)", "cells": int(ext_mask.sum())}
+    ext_mask = binary_closing(ext_mask, structure=np.ones((3, 3), dtype=bool), iterations=1)
+    comps, ncomp = label(ext_mask, structure=np.ones((3, 3), dtype=bool))
+    sizes = np.bincount(comps.ravel())
+    body_area = float(body_poly.area)
+    rects, cell_list = [], []
+    body_pts = xy  # 用于判断底端方向
+    for ci in range(1, ncomp + 1):
+        k = int(sizes[ci])
+        if k < RAMP_MIN_CELLS or k > 0.03 * max(int(occ2.sum()), 1):
+            continue
+        cells = comps == ci
+        cys, cxs = np.nonzero(cells)
+        cxy = np.column_stack([origin[0] + (cxs + 0.5) * RAMP_GRID,
+                               origin[1] + (cys + 0.5) * RAMP_GRID])
+        center = cxy.mean(axis=0)
+        q = cxy - center
+        _, _, vt = np.linalg.svd(q, full_matrices=False)
+        d0 = vt[0] / float(np.linalg.norm(vt[0]))
+        d1 = np.array([-d0[1], d0[0]])
+        p = np.column_stack([q @ d0, q @ d1])
+        L = float(np.percentile(p[:, 0], 99.0) - np.percentile(p[:, 0], 1.0))
+        w = float(np.percentile(p[:, 1], 97.5) - np.percentile(p[:, 1], 2.5))
+        if (L < RAMP_MIN_LEN or w < RAMP_MIN_WIDTH or w > RAMP_MAX_WIDTH
+                or L / max(w, 1e-6) < RAMP_ASPECT_MIN or not L):
+            continue
+        p0, p1 = float(np.percentile(p[:, 0], 1.0)), float(np.percentile(p[:, 0], 99.0))
+        m_body = float(np.median((body_pts - center) @ d0))
+        m_ramp = float(np.median(p[:, 0]))
+        a0, a1 = (p0 - RAMP_EXTEND, p1) if m_body < m_ramp else (p0, p1 + RAMP_EXTEND)
+        halfw = w / 2.0 + RAMP_W_MARGIN
+        corners = np.array([center + a0 * d0 - halfw * d1,
+                            center + a0 * d0 + halfw * d1,
+                            center + a1 * d0 + halfw * d1,
+                            center + a1 * d0 - halfw * d1])
+        rect = Polygon(corners)
+        if rect.is_valid and rect.area <= RAMP_AREA_MAX_FRAC * max(body_area, 1.0):
+            rects.append(rect)
+            cell_list.append(cxy)
+    info = {"status": "ok",
+            "body_area_m2": round(body_area, 1),
+            "exterior_cells": int(ext_mask.sum()),
+            "components": int(ncomp), "rects": len(rects)}
+    return rects, cell_list, info
+
+
 def orthogonal_connect(pts, grid_size=GRID_SIZE, bridge_dist=BRIDGE_DIST,
                        flatten_tol=FLATTEN_TOL, morph=MORPH, guide=None):
     """guide: 可选"外圈点云(红点)"，用于局部补凸/拉回(用户方案A)。"""
@@ -593,10 +695,22 @@ def read_wall_xy(ply_path):
     return pts[:, :2]
 
 
-def plot(wall_xy, coords, path, title):
+def plot(wall_xy, coords, path, title, ramp_cells=None, ramp_rects=None, ramp_guide=None):
     fig, ax = plt.subplots(figsize=(14, 8))
     ax.scatter(wall_xy[:, 0], wall_xy[:, 1], s=0.1, c="#c6dbef", alpha=0.2, label="墙点投影")
-    ax.plot(coords[:, 0], coords[:, 1], color="red", lw=3.0, label="正交轮廓")
+    if ramp_guide is not None and len(ramp_guide):
+        rm = ramp_guide if ramp_guide.ndim <= 2 else ramp_guide
+        ax.scatter(rm[:, 0], rm[:, 1], s=0.8, c="#9467bd", marker=".", alpha=0.7,
+                   label="坡道走廊点(基线)")
+    if ramp_cells is not None and len(ramp_cells):
+        cc = np.vstack(ramp_cells)
+        ax.scatter(cc[:, 0], cc[:, 1], s=1.5, c="#2ca02c", marker="o", alpha=0.9,
+                   label="伸出格(入口/突出结构)")
+    ax.plot(coords[:, 0], coords[:, 1], color="red", lw=3.0, label="正交轮廓(含入口)")
+    if ramp_rects is not None:
+        for r in ramp_rects:
+            rx, ry = np.asarray(r.exterior.coords).T
+            ax.plot(rx, ry, "--", color="#d62728", lw=1.6, alpha=0.85, label="入口定向矩形")
     ax.set_aspect("equal")
     ax.set_title(title)
     ax.set_xlabel("X (m)")
@@ -614,14 +728,16 @@ def process(base, wall_ply, out_dir):
     if len(wall_xy) < 3:
         print("墙点过少，跳过")
         return
-    # 尝试找对应源点云算"外圈点云(红点)"，用于局部补凸/拉回
+    # 尝试找对应源点云算"外圈点云(红点)"，用于局部补凸/拉回；并检测入口坡道走廊
     guide = None
+    ramp_rects, ramp_cells, ramp_info = [], [], {}
     src_found = None
     for ext in (".ply", ".las", ".laz"):
         cand = os.path.join(os.path.dirname(wall_ply), "..", base + ext)
         if os.path.exists(cand):
             src_found = cand
             break
+    raw = None
     if src_found and os.path.exists(src_found):
         try:
             raw = outer_mod.read_xyz(src_found)
@@ -629,17 +745,83 @@ def process(base, wall_ply, out_dir):
             guide = raw[red][:, :2]
             print("引导(外圈点云红点)=%d" % len(guide))
         except Exception:
+            raw = None
             guide = None
     coords = orthogonal_connect(wall_xy, guide=guide)  # 用户版连线规则(线必须水平/竖直)
+    # v0.28：以正交主体轮廓为基准检测伸出结构(入口坡道)，并集 -> 一个闭合体
+    if raw is not None:
+        try:
+            body_poly = Polygon(coords)
+            ramp_rects, ramp_cells, ramp_info = detect_ramp(raw, body_poly)
+            print("入口坡道检测: %s | 坡道矩形=%d" % (ramp_info.get("status"), len(ramp_rects)))
+        except Exception as e:
+            print("入口坡道检测异常(跳过):", e)
+    merged = Polygon(coords)
+    if ramp_rects:
+        # 安全护栏(逐个矩形验收): 用红点(外圈点云=验证基准)度量"并入前 vs 并入
+        # 后"的红点->轮廓边长距离均方(EDGE 采样 0.3m! 顶点间距数十米, 不能用
+        # 顶点距离)。坡道区域本身无红点(高密度判据不覆盖坡面), 整体 d² 必然
+        # 上升; 只并入"并入后红点 d² 不劣化"的矩形, 其余丢弃。
+        # (真实需要伸出的结构附近通常有墙点/红点支撑, 靠近则 d² 下降)
+        if guide is not None:
+            try:
+                from scipy.spatial import cKDTree as _T2
+
+                def _edge_d2(poly, ref_pts, step=0.3):
+                    vv = np.asarray(poly.exterior.coords)
+                    seg = np.diff(np.vstack([vv, vv[:1]]), axis=0)
+                    sl = np.linalg.norm(seg, axis=1)
+                    acc = []
+                    for i in range(len(seg)):
+                        L = sl[i]
+                        ns = max(int(L / step), 1)
+                        k = np.linspace(0.0, 1.0, ns, endpoint=False)[:, None]
+                        acc.append(vv[i] + seg[i] * k)
+                    pts_e = np.vstack(acc)
+                    return float(np.mean(_T2(pts_e).query(ref_pts, k=1)[0] ** 2))
+
+                d_old = _edge_d2(Polygon(coords), guide)
+                cur = Polygon(coords)
+                adopted_rects = []
+                for r in ramp_rects:
+                    cand = cur.union(r).buffer(0)
+                    if cand.geom_type == "MultiPolygon":
+                        cand = max(cand.geoms, key=lambda gp: gp.area)
+                    d_cand = _edge_d2(cand, guide)
+                    if d_cand <= d_old * 1.05 + 0.05:
+                        adopted_rects.append(r)
+                        cur = cand
+                dropped = len(ramp_rects) - len(adopted_rects)
+                ramp_rects = adopted_rects
+                ramp_cells = ramp_cells[:len(ramp_rects)]
+                print("护栏: 红点d²=%.3f; 逐矩形验收通过 %d, 丢弃 %d" % (
+                    d_old, len(ramp_rects), dropped))
+            except Exception as e2:
+                print("护栏异常(跳过验收):", e2)
+        for r in ramp_rects:
+            merged = merged.union(r)
+            if merged.geom_type == "MultiPolygon":
+                merged = max(merged.geoms, key=lambda gp: gp.area)
+            merged = merged.buffer(0)
+        if merged.is_valid and merged.geom_type == "Polygon":
+            coords = remove_collinear_points(np.array(merged.exterior.coords)[:-1])
+            print("并入入口坡道后: 顶点=%d, 面积=%.1f m²" % (len(coords) - 1, merged.area))
+        else:
+            coords = np.array(merged.exterior.coords)[:-1] if merged.geom_type == "Polygon" else coords
     poly = Polygon(coords)
     info = {
         "file": wall_ply,
         "vertices": int(len(coords) - 1),
         "area_m2": round(float(poly.area), 2),
         "perimeter_m": round(float(poly.length), 2),
+        "ramps": [{"orient_rect": [[round(float(x), 3), round(float(y), 3)] for x, y in
+                                   np.asarray(r.exterior.coords)[:-1]]}
+                  for r in ramp_rects],
+        "ramp_info": ramp_info,
         "vertex_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in coords[:-1]],
     }
-    plot(wall_xy, coords, "%s/%s_正交轮廓.png" % (out_dir, base), "%s 正交轮廓" % base)
+    plot(wall_xy, coords, "%s/%s_正交轮廓.png" % (out_dir, base), "%s 正交轮廓(含入口)" % base,
+         ramp_cells=ramp_cells, ramp_rects=ramp_rects)
     with open("%s/%s_正交轮廓.json" % (out_dir, base), "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
     print("正交轮廓: 顶点=%d, 面积=%.1f m², 周长=%.1f m" % (info["vertices"], info["area_m2"], info["perimeter_m"]))
