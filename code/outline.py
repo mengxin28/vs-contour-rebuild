@@ -741,9 +741,13 @@ def process(base, wall_ply, out_dir):
     if src_found and os.path.exists(src_found):
         try:
             raw = outer_mod.read_xyz(src_found)
+            # 引导(贴墙外皮)用旧红点: 紧致直接贴外墙皮(实测梯度墙点带宽导致
+            # hug 98分位外皮被外推 d² 0.987->2.332)。梯度法墙点单独输出标注。
             red, orange, _i = outer_mod.classify(raw)
             guide = raw[red][:, :2]
-            print("引导(外圈点云红点)=%d" % len(guide))
+            wall, col, _gi = outer_mod.detect_wall_columns(raw)
+            print("引导(外圈红点)=%d | 梯度法墙点=%d 柱点=%d" % (
+                len(guide), int(wall.sum()), int(col.sum())))
         except Exception:
             raw = None
             guide = None

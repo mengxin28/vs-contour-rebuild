@@ -52,7 +52,7 @@ def classify_bin(dists, s_vals, total_len, bin_len=BIN_LEN):
     return np.floor(s_vals / bin_len).astype(int)
 
 
-def process(source, outline_json, out_dir):
+def process(source, outline_json, out_dir, gradient=False):
     base = os.path.splitext(os.path.basename(outline_json))[0].replace("_正交轮廓", "")
     print("========== 精度验证: %s ==========" % base)
     # 1) 轮廓线：读 json 顶点, 闭合后采样
@@ -60,10 +60,25 @@ def process(source, outline_json, out_dir):
     verts = np.array(info["vertex_xy"])          # 开口顶点
     samples, s_vals = densify_ring(verts)
     total_len = float(s_vals[-1] + np.linalg.norm(verts[-1] - verts[0]))
-    # 2) 外圈点云(红点)
+    # 2) 外圈点云(红点): 默认旧路径 classify; --gradient 用梯度法墙点∩外圈带
     raw = outer_mod.read_xyz(source)
-    red, orange, _i = outer_mod.classify(raw)
-    red_xy = raw[red][:, :2]
+    if gradient:
+        wall, col, _g = outer_mod.detect_wall_columns(raw)
+        # 外圈过滤: 只保留梯度墙点中"距全部点足迹外边界 ≤1.0m"的点
+        # (与 validate 口径一致: 验证基准=外墙点, 内墙/柱不参与)
+        xy_a = raw[:, :2]
+        mask, g_, (x0, y0), grid = outer_mod.footprint_mask(xy_a)
+        from scipy.ndimage import distance_transform_edt as _dt
+        dist_c = _dt(mask)
+        inb = ((g_[:, 0] >= 0) & (g_[:, 0] < mask.shape[1]) &
+               (g_[:, 1] >= 0) & (g_[:, 1] < mask.shape[0]))
+        d_ = np.zeros(len(raw))
+        d_[inb] = dist_c[g_[inb, 1], g_[inb, 0]]
+        red_xy = raw[wall][:, :2][d_[wall] <= 1.0]
+        red, orange, _i = None, None, None
+    else:
+        red, orange, _i = outer_mod.classify(raw)
+        red_xy = raw[red][:, :2]
     print("外圈点=%d, 轮廓采样=%d, 轮廓总长=%.1fm" % (len(red_xy), len(samples), total_len))
     # 3) 每个外圈点 -> 轮廓最近样本 -> 距离d, d², 所在5m段
     tree = cKDTree(samples)
@@ -119,9 +134,11 @@ def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
+    gradient = "--gradient" in sys.argv
+    files = [a for a in sys.argv[1:] if not a.startswith("--")][:2]
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "输出")
     os.makedirs(out_dir, exist_ok=True)
-    process(sys.argv[1], sys.argv[2], out_dir)
+    process(files[0], files[1], out_dir, gradient=gradient)
 
 
 if __name__ == "__main__":
