@@ -52,6 +52,30 @@ CAR_ASPECT = 1.4
 CAR_NEAR_WALL_M = 1.5  # 距墙带域 ≤1.5m 可视为墙侧延伸保留
 COL_BAND_W = 5.0     # 墙带域最大宽度(m): 墙为细长带(≤烟囱/楼梯间宽)
 
+# ------------------- v0.30 入口坡道补充检测(移植自"坡道优化包"outer.py) -------------------
+RAMP_GRID = 0.5                # 常规坡道分带栅格(m)
+RAMP_SMOOTH_SIGMA = 1.0
+RAMP_MIN_POINTS = 3            # 常规坡道每格最少点数
+RAMP_MAX_CELL_Z_SPAN = 0.8     # 格内 z 跨度上限(单面)
+RAMP_MIN_SLOPE_DEG = 3.0
+RAMP_MAX_SLOPE_DEG = 20.0
+RAMP_OUTER_BAND = 1.5          # 只在外圈带找坡道(m)
+RAMP_GRADIENT_PCT = 75         # 密度梯度种子分位
+RAMP_MIN_COMPONENT_CELLS = 8
+RAMP_MIN_SEED_CELLS = 3
+RAMP_MIN_RISE = 0.2
+# 长稀疏坡道分支(CLEAN 类: 每格仅1~2点)
+SPARSE_RAMP_MIN_POINTS = 1
+SPARSE_RAMP_GRADIENT_PCT = 60
+SPARSE_RAMP_MIN_COMPONENT_CELLS = 50
+SPARSE_RAMP_MIN_SEED_CELLS = 10
+SPARSE_RAMP_MIN_RISE = 1.0
+SPARSE_RAMP_MIN_LENGTH_CELLS = 20
+SPARSE_RAMP_MIN_ASPECT = 2.0   # 方向无关长宽比
+SPARSE_RAMP_MAX_MEDIAN_POINTS = 2.0
+SPARSE_RAMP_MAX_PLANE_RESIDUAL = 0.15  # 平面拟合残差(m)
+COARSE_COMPONENT_GRID = 5.0    # 稠密栅格前先5m粗网格筛最大连通
+
 
 def read_las_xyz(path, chunk=2_000_000):
     """自写 LAS 读取（未压缩 LAS 1.x），返回 (N,3) float64 米制坐标。"""
@@ -84,6 +108,195 @@ def read_xyz(path):
     if pts.size == 0:
         raise ValueError("空点云: %s" % path)
     return pts
+
+
+def largest_xy_component_mask(xy, coarse_grid=COARSE_COMPONENT_GRID):
+    """v0.30 移植(坡道优化包): 建立稠密栅格前, 用稀疏粗网格保留点数最多的连通主体。
+    避免远处孤立点把稠密栅格尺寸异常放大/污染 footprint。"""
+    if len(xy) == 0:
+        return np.zeros(0, dtype=bool)
+    origin = xy.min(axis=0)
+    coarse = np.floor((xy - origin) / coarse_grid).astype(np.int64)
+    cells, inverse, counts = np.unique(
+        coarse, axis=0, return_inverse=True, return_counts=True)
+    if len(cells) == 1:
+        return np.ones(len(xy), dtype=bool)
+    lookup = {(int(x), int(y)): i for i, (x, y) in enumerate(cells)}
+    visited = np.zeros(len(cells), dtype=bool)
+    best_ids, best_weight = [], -1
+    for start in range(len(cells)):
+        if visited[start]:
+            continue
+        stack, seen = [start], [start]
+        visited[start] = True
+        weight = 0
+        while stack:
+            cur = stack.pop()
+            weight += int(counts[cur])
+            cx, cy = cells[cur]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nb = lookup.get((int(cx + dx), int(cy + dy)))
+                    if nb is not None and not visited[nb]:
+                        visited[nb] = True
+                        stack.append(nb)
+                        seen.append(nb)
+        if weight > best_weight:
+            best_ids, best_weight = seen, weight
+    return np.isin(inverse, best_ids)
+
+
+def detect_slope_gradient_points(raw, grid=RAMP_GRID):
+    """v0.30 移植(坡道优化包): 密度梯度种子 + 连续高程坡度, 补回入口坡道边界点。
+    常规分支(每格≥3点, 坡度3°~20°, 邻格高程90分位涨落≤max_slope*grid) +
+    长稀疏分支(每格1点: 方向无关长宽比≥2 + 高差≥1m + 平面拟合残差≤0.15m)。"""
+    empty = np.zeros(len(raw), dtype=bool)
+    empty_info = {"points": 0, "cells": 0, "seed_cells": 0, "components": 0,
+                  "dense_components": 0, "sparse_components": 0, "sparse_points": 0,
+                  "gradient_threshold": 0.0, "sparse_gradient_threshold": 0.0}
+    if len(raw) < RAMP_MIN_POINTS:
+        return empty, empty_info
+    source_main = largest_xy_component_mask(raw[:, :2])
+    work = raw[source_main]
+    if len(work) < RAMP_MIN_POINTS:
+        return empty, empty_info
+    xy = work[:, :2]
+    origin = xy.min(axis=0)
+    cell = np.floor((xy - origin) / grid).astype(np.int64)
+    nx, ny = cell.max(axis=0) + 1
+    if nx < 3 or ny < 3:
+        return empty, empty_info
+    linear = cell[:, 1] * nx + cell[:, 0]
+    size = int(nx * ny)
+    count = np.bincount(linear, minlength=size).reshape(ny, nx)
+    occupied = count > 0
+    connected = binary_closing(occupied, structure=np.ones((3, 3), dtype=bool), iterations=1)
+    components, _ = label(connected, structure=np.ones((3, 3), dtype=bool))
+    component_sizes = np.bincount(components.ravel())
+    if len(component_sizes) <= 1:
+        return empty, empty_info
+    component_sizes[0] = 0
+    main = components == int(component_sizes.argmax())
+    z_sum = np.bincount(linear, weights=work[:, 2], minlength=size).reshape(ny, nx)
+    z_mean = np.zeros((ny, nx), dtype=np.float64)
+    z_mean[occupied] = z_sum[occupied] / count[occupied]
+    z_min = np.full(size, np.inf, dtype=np.float64)
+    z_max = np.full(size, -np.inf, dtype=np.float64)
+    np.minimum.at(z_min, linear, work[:, 2])
+    np.maximum.at(z_max, linear, work[:, 2])
+    z_span = (z_max - z_min).reshape(ny, nx)
+    surface = (main & (count >= RAMP_MIN_POINTS) & (z_span <= RAMP_MAX_CELL_Z_SPAN))
+    support = gaussian_filter(surface.astype(np.float64), RAMP_SMOOTH_SIGMA)
+    smooth_z = gaussian_filter(z_mean * surface, RAMP_SMOOTH_SIGMA)
+    smooth_z /= np.maximum(support, 1e-6)
+    grad_y, grad_x = np.gradient(smooth_z, grid)
+    slope = np.hypot(grad_x, grad_y)
+    min_slope = np.tan(np.deg2rad(RAMP_MIN_SLOPE_DEG))
+    max_slope = np.tan(np.deg2rad(RAMP_MAX_SLOPE_DEG))
+    exterior_footprint = binary_fill_holes(main)
+    boundary = (exterior_footprint &
+                (distance_transform_edt(exterior_footprint) <= RAMP_OUTER_BAND / grid))
+    slope_support = (boundary & surface & (support >= 0.45) &
+                     (slope >= min_slope) & (slope <= max_slope))
+    smooth_density = gaussian_filter(np.log1p(count), RAMP_SMOOTH_SIGMA)
+    density_gradient = np.hypot(sobel(smooth_density, axis=0), sobel(smooth_density, axis=1))
+    gradient_sample = density_gradient[boundary & surface]
+    if gradient_sample.size == 0:
+        return empty, empty_info
+    gradient_threshold = float(np.percentile(gradient_sample, RAMP_GRADIENT_PCT))
+    gradient_seeds = slope_support & (density_gradient >= gradient_threshold)
+    slope_components, _ = label(slope_support, structure=np.ones((3, 3), dtype=bool))
+    sizes = np.bincount(slope_components.ravel())
+    seed_counts = np.bincount(slope_components.ravel(), weights=gradient_seeds.ravel())
+    keep_ids = []
+    for component_id in range(1, len(sizes)):
+        if (sizes[component_id] < RAMP_MIN_COMPONENT_CELLS or
+                seed_counts[component_id] < RAMP_MIN_SEED_CELLS):
+            continue
+        component = slope_components == component_id
+        if np.ptp(z_mean[component]) < RAMP_MIN_RISE:
+            continue
+        horizontal = component[:, :-1] & component[:, 1:]
+        vertical = component[:-1, :] & component[1:, :]
+        neighbor_rises = np.concatenate([
+            np.abs(np.diff(z_mean, axis=1))[horizontal],
+            np.abs(np.diff(z_mean, axis=0))[vertical]])
+        # 连续坡道逐格变化; 两块平地之间的突跳不能靠平滑伪装成坡面
+        if (neighbor_rises.size and
+                np.percentile(neighbor_rises, 90) <= max_slope * grid):
+            keep_ids.append(component_id)
+    kept_cells = np.isin(slope_components, keep_ids)
+    # ---- 长稀疏坡道分支: 允许每格仅1个点, 用长度/长宽比/高差/拟合残差收紧 ----
+    sparse_surface = (main & (count >= SPARSE_RAMP_MIN_POINTS) &
+                      (z_span <= RAMP_MAX_CELL_Z_SPAN))
+    sparse_blur = gaussian_filter(sparse_surface.astype(np.float64), RAMP_SMOOTH_SIGMA)
+    sparse_z = gaussian_filter(z_mean * sparse_surface, RAMP_SMOOTH_SIGMA)
+    sparse_z /= np.maximum(sparse_blur, 1e-6)
+    sparse_grad_y, sparse_grad_x = np.gradient(sparse_z, grid)
+    sparse_slope = np.hypot(sparse_grad_x, sparse_grad_y)
+    sparse_support = (boundary & sparse_surface & (sparse_blur >= 0.45) &
+                      (sparse_slope >= min_slope) & (sparse_slope <= max_slope))
+    sparse_sample = density_gradient[boundary & sparse_surface]
+    sparse_threshold = (float(np.percentile(sparse_sample, SPARSE_RAMP_GRADIENT_PCT))
+                        if sparse_sample.size else np.inf)
+    sparse_seeds = sparse_support & (density_gradient >= sparse_threshold)
+    sparse_labels, _ = label(sparse_support, structure=np.ones((3, 3), dtype=bool))
+    sparse_sizes = np.bincount(sparse_labels.ravel())
+    sparse_seed_counts = np.bincount(sparse_labels.ravel(), weights=sparse_seeds.ravel())
+    sparse_ids = []
+    for component_id in range(1, len(sparse_sizes)):
+        if (sparse_sizes[component_id] < SPARSE_RAMP_MIN_COMPONENT_CELLS or
+                sparse_seed_counts[component_id] < SPARSE_RAMP_MIN_SEED_CELLS):
+            continue
+        component = sparse_labels == component_id
+        rows, cols = np.where(component)
+        coordinates = np.column_stack([cols, rows]).astype(np.float64)
+        centered = coordinates - coordinates.mean(axis=0)
+        _, _, axes = np.linalg.svd(centered, full_matrices=False)
+        projected = centered @ axes.T
+        spans = np.ptp(projected, axis=0) + 1.0
+        major, minor = float(spans.max()), float(spans.min())
+        if (major < SPARSE_RAMP_MIN_LENGTH_CELLS or
+                major / max(minor, 1) < SPARSE_RAMP_MIN_ASPECT or
+                np.median(count[component]) > SPARSE_RAMP_MAX_MEDIAN_POINTS or
+                np.ptp(z_mean[component]) < SPARSE_RAMP_MIN_RISE):
+            continue
+        horizontal = component[:, :-1] & component[:, 1:]
+        vertical = component[:-1, :] & component[1:, :]
+        neighbor_rises = np.concatenate([
+            np.abs(np.diff(z_mean, axis=1))[horizontal],
+            np.abs(np.diff(z_mean, axis=0))[vertical]])
+        if (not neighbor_rises.size or
+                np.percentile(neighbor_rises, 90) > max_slope * grid):
+            continue
+        design = np.column_stack([
+            cols - cols.mean(), rows - rows.mean(), np.ones(len(rows))])
+        fitted = design @ np.linalg.lstsq(design, z_mean[component], rcond=None)[0]
+        residual = float(np.sqrt(np.mean((z_mean[component] - fitted) ** 2)))
+        if residual <= SPARSE_RAMP_MAX_PLANE_RESIDUAL:
+            sparse_ids.append(component_id)
+    sparse_cells = np.isin(sparse_labels, sparse_ids) & ~kept_cells
+    kept_cells |= sparse_cells
+    detected_work = kept_cells.ravel()[linear]
+    sparse_detected = sparse_cells.ravel()[linear]
+    detected = np.zeros(len(raw), dtype=bool)
+    detected[source_main] = detected_work
+    info = {
+        "points": int(detected.sum()),
+        "cells": int(kept_cells.sum()),
+        "seed_cells": int((gradient_seeds & kept_cells).sum() +
+                          (sparse_seeds & sparse_cells).sum()),
+        "components": int(len(keep_ids) + len(sparse_ids)),
+        "dense_components": int(len(keep_ids)),
+        "sparse_components": int(len(sparse_ids)),
+        "sparse_points": int(sparse_detected.sum()),
+        "gradient_threshold": round(gradient_threshold, 3),
+        "sparse_gradient_threshold": (round(sparse_threshold, 3)
+                                      if np.isfinite(sparse_threshold) else 0.0),
+    }
+    return detected, info
 
 
 def footprint_mask(xy, grid=GRID, close_iter=CLOSE_ITER):
@@ -190,9 +403,10 @@ def detect_wall_columns(raw, g_thr=WALL_G_THR, d_thr=WALL_D_THR,
 
 
 def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
-             local_cell=LOCAL_CELL, band=BAND):
+             local_cell=LOCAL_CELL, band=BAND, return_ramp=False):
     """标记条件 = 局域前local_pct% AND 全局前global_pct% AND 外圈位置。
-    返回 (red, orange, info)。"""
+    return_ramp=True 时并入坡道补充点(紫)并返回 (red, orange, info, ramp)。
+    返回 (red, orange, info) 或 (red, orange, info, ramp)。"""
     xy = raw[:, :2]
     # 1) 竖直堆叠密度：同 0.3m XY 柱内点数
     cell = np.floor(xy / COL_GRID).astype(np.int64)
@@ -228,6 +442,12 @@ def classify(raw, global_pct=GLOBAL_PCT, local_pct=LOCAL_PCT,
     orange = dual & ~outer              # 双密度门槛 但不在外圈
     info = {"global_thr": int(global_thr), "global_top": int(global_top.sum()),
             "dual": int((dual).sum()), "red": int(red.sum()), "orange": int(orange.sum())}
+    if return_ramp:
+        ramp, ramp_info = detect_slope_gradient_points(raw)
+        red = red | ramp                # 外墙高密度点 + 入口坡道补充点(紫)
+        orange = orange & ~red
+        info["ramp"] = ramp_info
+        return red, orange, info, ramp
     return red, orange, info
 
 

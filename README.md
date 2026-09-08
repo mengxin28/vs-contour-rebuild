@@ -64,6 +64,13 @@ python code/outline.py 输出/粟塘B1_wall.ply 输出/雅德B1_wall.ply
 - 连通域过滤：只保留最大连通块(`KEEP_ONLY_BIGGEST`)，剔除脱离主体的墙外噪声
 - 密度=竖直堆叠密度(0.1m XY柱内点数)；参数 `COL_GRID=0.1`、`GRID=0.5`、`BAND=1.0`
 
+贴合简洁外包多边形（`code/label_outline.py` v0.30）：
+- 输入：源点云 + 阶段一 `*_wall.ply`；
+- 流程：`classify(return_ramp=True)` 红∪紫引导 → `orthogonal_connect` 连线+正交+hug贴墙
+  → `attach_ramp_protrusion` 紫点带外皮贴附(正交台阶) → DP 简化(0.8m, 面积>2%回退)；
+- 输出：`*_贴合轮廓.png`(红/紫点+黑粗线)、`*_贴合轮廓.json`(顶点/面积/周长/紫点信息)。
+示例：`python code/label_outline.py CLEAN_UNDER_GROUND.ply 输出/CLEAN_UNDER_GROUND_wall.ply`
+
 梯度法墙柱标注（`code/outer.py --gradient` v0.29，`detect_wall_columns`）：
 - 0.1m 单元竖直堆叠密度场 → 高斯平滑(σ=0.2m) → sobel 梯度；
 - 候选 = 梯度≥`WALL_G_THR` 且 密度≥`WALL_D_THR`（车密度低, 高梯度毛刺被压掉）；
